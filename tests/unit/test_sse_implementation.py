@@ -97,9 +97,9 @@ class TestStreamingChunkBuilding:
         assert final_chunk["is_finished"]
         assert final_chunk["finish_reason"] == "stop"
         assert final_chunk["usage"] is not None
-        # Check that usage has the expected prompt_tokens and completion_tokens
-        assert final_chunk["usage"].prompt_tokens == PROMPT_TOKENS_TEST
-        assert final_chunk["usage"].completion_tokens == COMPLETION_TOKENS_TEST
+        # usage is a ChatCompletionUsageBlock (a plain dict) so litellm can splat it.
+        assert final_chunk["usage"]["prompt_tokens"] == PROMPT_TOKENS_TEST
+        assert final_chunk["usage"]["completion_tokens"] == COMPLETION_TOKENS_TEST
         assert final_chunk["index"] == 0
 
 

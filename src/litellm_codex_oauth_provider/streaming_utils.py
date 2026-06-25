@@ -14,7 +14,23 @@ from __future__ import annotations
 
 from typing import TypedDict
 
-from litellm.types.utils import GenericStreamingChunk, Usage
+from litellm.types.utils import ChatCompletionUsageBlock, GenericStreamingChunk
+
+
+def _usage_block(usage: dict[str, int] | None) -> ChatCompletionUsageBlock | None:
+    """Build a GenericStreamingChunk usage block (a plain dict).
+
+    GenericStreamingChunk.usage must be a ChatCompletionUsageBlock (a TypedDict),
+    not a Usage model -- litellm's stream handler does ``Usage(**chunk.usage)`` and
+    crashes if it gets a Usage object.
+    """
+    if not usage:
+        return None
+    return ChatCompletionUsageBlock(
+        prompt_tokens=int(usage.get("prompt_tokens", 0)),
+        completion_tokens=int(usage.get("completion_tokens", 0)),
+        total_tokens=int(usage.get("total_tokens", 0)),
+    )
 
 
 # Tool call chunk structures as defined in comments.md
@@ -169,21 +185,13 @@ def build_final_chunk(
     GenericStreamingChunk
         Final streaming chunk with usage and completion status
     """
-    usage_obj = None
-    if usage:
-        usage_obj = Usage(
-            prompt_tokens=int(usage.get("prompt_tokens", 0)),
-            completion_tokens=int(usage.get("completion_tokens", 0)),
-            total_tokens=int(usage.get("total_tokens", 0)),
-        )
-
     return GenericStreamingChunk(
         text="",
         tool_use=None,
         is_finished=True,
         finish_reason=finish_reason,
         index=index,
-        usage=usage_obj,
+        usage=_usage_block(usage),
     )
 
 
@@ -210,21 +218,13 @@ def build_completion_text_chunk(
     GenericStreamingChunk
         Formatted completion chunk
     """
-    usage_obj = None
-    if usage:
-        usage_obj = Usage(
-            prompt_tokens=int(usage.get("prompt_tokens", 0)),
-            completion_tokens=int(usage.get("completion_tokens", 0)),
-            total_tokens=int(usage.get("total_tokens", 0)),
-        )
-
     return GenericStreamingChunk(
         text=text,
         tool_use=None,
         is_finished=True,
         finish_reason=finish_reason,
         index=index,
-        usage=usage_obj,
+        usage=_usage_block(usage),
     )
 
 
