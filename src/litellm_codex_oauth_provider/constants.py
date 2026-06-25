@@ -120,3 +120,12 @@ CODEX_INSTRUCTIONS_CACHE_TTL_SECONDS = 15 * 60  # 15 minutes
 # Token cache settings
 TOKEN_CACHE_BUFFER_SECONDS = 300  # 5 minutes
 TOKEN_DEFAULT_EXPIRY_SECONDS = 3600  # 1 hour
+
+# OAuth token refresh (matches the Codex CLI's login client).
+# The endpoint and public client id are the same ones `codex login` uses; the
+# refresh exchange swaps a long-lived refresh_token for a fresh access_token.
+OAUTH_TOKEN_URL = os.getenv("CODEX_OAUTH_TOKEN_URL", "https://auth.openai.com/oauth/token")
+CODEX_OAUTH_CLIENT_ID = os.getenv("CODEX_OAUTH_CLIENT_ID", "app_EMoamEEZ73f0CkXaXp7hrann")
+OAUTH_REFRESH_SCOPE = "openid profile email"
+# Refresh a JWT this long before its `exp` so in-flight requests don't race expiry.
+TOKEN_REFRESH_LEEWAY_SECONDS = 300  # 5 minutes

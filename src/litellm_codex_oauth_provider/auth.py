@@ -16,10 +16,15 @@ and extensive validation while preserving core authentication functionality.
 from __future__ import annotations
 
 import base64
+import datetime
 import json
+import os
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+
+import httpx
 
 from . import constants
 from .exceptions import (
@@ -94,6 +99,119 @@ def _load_auth_data() -> dict[str, Any]:
         raise CodexAuthTokenError(f"Failed to read Codex auth data: {e}") from e
 
 
+def _token_container(auth_data: dict[str, Any]) -> dict[str, Any]:
+    """Return the sub-dict of auth.json that holds the OAuth tokens.
+
+    Codex CLI writes ``{"tokens": {...}}``; older/alternate formats use
+    ``{"chatgpt": {...}}`` or a flat ``{"access_token": ...}``. The returned
+    dict is a live reference into ``auth_data``, so callers can mutate it in
+    place and persist the whole structure back with :func:`_write_auth_data`.
+
+    Parameters
+    ----------
+    auth_data : dict[str, Any]
+        Parsed contents of auth.json.
+
+    Returns
+    -------
+    dict[str, Any]
+        The dict containing ``access_token`` / ``refresh_token``.
+
+    Raises
+    ------
+    CodexAuthTokenError
+        If no recognised token container is present.
+    """
+    if "tokens" in auth_data:
+        return auth_data["tokens"]
+    if "chatgpt" in auth_data:
+        return auth_data["chatgpt"]
+    if "access_token" in auth_data:
+        return auth_data
+    raise CodexAuthTokenError(
+        "Unsupported Codex auth.json structure. Expected one of: 'tokens', 'chatgpt', or 'access_token' keys."
+    )
+
+
+def _decode_jwt_payload(token: str) -> dict[str, Any]:
+    """Decode (without verifying) the payload of a JWT access token.
+
+    Parameters
+    ----------
+    token : str
+        JWT access token.
+
+    Returns
+    -------
+    dict[str, Any]
+        The decoded claims, or an empty dict if the token is not a JWT.
+    """
+    try:
+        _, payload_b64, _ = token.split(".")
+        padding = "=" * (-len(payload_b64) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload_b64 + padding))
+    except Exception:  # noqa: BLE001 - opaque/non-JWT tokens are handled by callers
+        return {}
+
+
+def _token_expiry(token: str) -> float | None:
+    """Return the JWT ``exp`` (epoch seconds) of an access token, if present."""
+    exp = _decode_jwt_payload(token).get("exp")
+    try:
+        return float(exp) if exp is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _token_needs_refresh(token: str, leeway: float | None = None) -> bool:
+    """Whether ``token`` is expired or within ``leeway`` seconds of expiring.
+
+    A token with no decodable ``exp`` claim is treated as not-needing-refresh:
+    we cannot prove it is stale, and refreshing eagerly would defeat caching.
+    """
+    if leeway is None:
+        leeway = constants.TOKEN_REFRESH_LEEWAY_SECONDS
+    expiry = _token_expiry(token)
+    if expiry is None:
+        return False
+    return time.time() >= (expiry - leeway)
+
+
+def _write_auth_data(auth_data: dict[str, Any]) -> None:
+    """Atomically persist ``auth_data`` back to auth.json, preserving its mode.
+
+    Written via a temp file in the same directory + ``os.replace`` so a crashed
+    or concurrent write can never leave a truncated auth.json behind.
+
+    Raises
+    ------
+    CodexAuthRefreshError
+        If the refreshed tokens cannot be written back.
+    """
+    auth_path = _get_auth_path()
+    try:
+        mode = auth_path.stat().st_mode & 0o777
+    except OSError:
+        mode = 0o600
+
+    directory = str(auth_path.parent)
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".auth-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(auth_data, f, indent=2)
+            f.write("\n")
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, auth_path)
+    except Exception as exc:  # noqa: BLE001 - surface as a refresh failure
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise CodexAuthRefreshError(
+            f"Failed to persist refreshed Codex tokens to {auth_path}: {exc}"
+        ) from exc
+
+
 def _extract_bearer_token() -> str:
     """Extract the OAuth bearer token from Codex auth data.
 
@@ -113,19 +231,7 @@ def _extract_bearer_token() -> str:
     """
     auth_data = _load_auth_data()
 
-    # Handle nested structure: {"chatgpt": {"access_token": "...", ...}}
-    if "chatgpt" in auth_data:
-        token_data = auth_data["chatgpt"]
-    # Handle nested structure: {"tokens": {"access_token": "...", ...}}
-    elif "tokens" in auth_data:
-        token_data = auth_data["tokens"]
-    # Handle flat structure: {"access_token": "...", ...}
-    elif "access_token" in auth_data:
-        token_data = auth_data
-    else:
-        raise CodexAuthTokenError(
-            "Unsupported Codex auth.json structure. Expected one of: 'chatgpt', 'tokens', or 'access_token' keys."
-        )
+    token_data = _token_container(auth_data)
 
     access_token = token_data.get("access_token")
     if not access_token:
@@ -209,8 +315,18 @@ def get_auth_context() -> AuthContext:
     >>> print(f"Token: {context.access_token[:20]}...")
     >>> print(f"Account ID: {context.account_id}")
     """
-    # Extract bearer token
-    token = _extract_bearer_token()
+    # Extract the current bearer token. A token flagged expired via an explicit
+    # `expires_at` field is refreshed rather than fatal.
+    try:
+        token = _extract_bearer_token()
+        stale = _token_needs_refresh(token)
+    except CodexAuthTokenExpiredError:
+        token = None
+        stale = True
+
+    # Refresh proactively when the access token is expired or about to expire.
+    if stale:
+        token = _refresh_token()
 
     # Decode account ID from JWT
     account_id = _decode_account_id(token)
@@ -241,8 +357,8 @@ def _refresh_token() -> str:
         If no refresh token is available or refresh fails
     """
     auth_data = _load_auth_data()
-    chatgpt_data = auth_data.get("chatgpt", {})
-    refresh_token = chatgpt_data.get("refresh_token")
+    token_data = _token_container(auth_data)
+    refresh_token = token_data.get("refresh_token")
 
     if not refresh_token:
         raise CodexAuthRefreshError(
@@ -250,12 +366,60 @@ def _refresh_token() -> str:
             "Please ensure your auth.json file includes a 'refresh_token' field."
         )
 
-    # TODO: Implement actual token refresh logic
-    # For now, just raise an error since the refresh logic isn't implemented
-    raise CodexAuthRefreshError(
-        "Token refresh functionality is not yet implemented. "
-        "Please manually update your access token."
+    # Exchange the refresh token for a fresh access token using the same OAuth
+    # endpoint and public client id the Codex CLI uses for `codex login`.
+    request = {
+        "client_id": constants.CODEX_OAUTH_CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "scope": constants.OAUTH_REFRESH_SCOPE,
+    }
+
+    try:
+        response = httpx.post(
+            constants.OAUTH_TOKEN_URL,
+            json=request,
+            headers={"Content-Type": "application/json"},
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        refreshed = response.json()
+    except httpx.HTTPStatusError as exc:
+        raise CodexAuthRefreshError(
+            f"Codex OAuth token refresh failed ({exc.response.status_code}). "
+            "The refresh token may be revoked or expired; run 'codex login' again."
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise CodexAuthRefreshError(f"Codex OAuth token refresh request failed: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise CodexAuthRefreshError(f"Could not parse Codex OAuth refresh response: {exc}") from exc
+
+    new_access_token = refreshed.get("access_token")
+    if not new_access_token:
+        raise CodexAuthRefreshError("Codex OAuth refresh response did not include an access_token.")
+
+    # Persist the rotated credentials back, preserving any fields we don't touch.
+    token_data["access_token"] = new_access_token
+    if refreshed.get("refresh_token"):
+        token_data["refresh_token"] = refreshed["refresh_token"]
+    if refreshed.get("id_token"):
+        token_data["id_token"] = refreshed["id_token"]
+    expires_in = refreshed.get("expires_in")
+    if expires_in is not None:
+        try:
+            token_data["expires_at"] = time.time() + float(expires_in)
+        except (TypeError, ValueError):
+            pass
+    # Mirror the Codex CLI, which stamps the refresh time at the top level.
+    auth_data["last_refresh"] = (
+        datetime.datetime.now(datetime.timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
     )
+
+    _write_auth_data(auth_data)
+
+    return new_access_token
 
 
 def get_bearer_token() -> str:
