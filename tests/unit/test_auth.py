@@ -165,3 +165,71 @@ def test_refresh_token_missing_refresh_token(mock_auth_file: Path) -> None:
 
     with pytest.raises(CodexAuthRefreshError):
         _refresh_token()
+
+
+def _jwt(exp: float, account_id: str = "mock-account") -> str:
+    """Build an unsigned JWT carrying an exp and the ChatGPT account claim."""
+    import base64
+
+    def _enc(part: dict) -> str:
+        raw = json.dumps(part, separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    payload = {"exp": exp, "https://api.openai.com/auth": {"chatgpt_account_id": account_id}}
+    return f"{_enc({'alg': 'none'})}.{_enc(payload)}.sig"
+
+
+def test_refresh_token_success(mock_auth_file: Path, mocker: MockerFixture) -> None:
+    """Given a refresh token, when _refresh_token runs, then it rotates and persists tokens.
+
+    Verifies the OAuth exchange updates access/refresh/id tokens in auth.json in place so the
+    proxy keeps working without a manual re-login.
+    """
+    new_access = _jwt(time.time() + 3600)
+    with mock_auth_file.open("w") as f:
+        json.dump({"tokens": {"access_token": "old", "refresh_token": "old-refresh"}}, f)
+
+    resp = mocker.Mock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {
+        "access_token": new_access,
+        "refresh_token": "new-refresh",
+        "id_token": "new-id",
+        "expires_in": 3600,
+    }
+    post = mocker.patch("litellm_codex_oauth_provider.auth.httpx.post", return_value=resp)
+
+    returned = _refresh_token()
+
+    assert returned == new_access
+    # The OAuth exchange used the existing refresh token.
+    assert post.call_args.kwargs["json"]["refresh_token"] == "old-refresh"
+    # Rotated credentials were written back to disk.
+    persisted = json.loads(mock_auth_file.read_text())["tokens"]
+    assert persisted["access_token"] == new_access
+    assert persisted["refresh_token"] == "new-refresh"
+    assert persisted["id_token"] == "new-id"
+
+
+def test_get_auth_context_refreshes_expired_jwt(
+    mock_auth_file: Path, mocker: MockerFixture
+) -> None:
+    """Given an expired access token, when get_auth_context runs, then it refreshes transparently.
+
+    Ensures callers never see an expired token: the proxy refreshes proactively from the
+    refresh_token instead of failing the request.
+    """
+    fresh = _jwt(time.time() + 3600)
+    with mock_auth_file.open("w") as f:
+        json.dump(
+            {"tokens": {"access_token": _jwt(time.time() - 10), "refresh_token": "r"}}, f
+        )
+
+    resp = mocker.Mock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {"access_token": fresh, "expires_in": 3600}
+    mocker.patch("litellm_codex_oauth_provider.auth.httpx.post", return_value=resp)
+
+    context = get_auth_context()
+    assert context.access_token == fresh
+    assert context.account_id == "mock-account"

@@ -79,3 +79,20 @@ def mock_auth_file(
 
         mocker.patch("litellm_codex_oauth_provider.constants.DEFAULT_CODEX_AUTH_FILE", auth_file)
         yield auth_file
+
+
+@pytest.fixture(autouse=True)
+def _isolate_model_discovery(mocker: MockerFixture) -> None:
+    """Keep model discovery deterministic and offline for every unit test.
+
+    Resets the in-process model cache between tests and makes the provider's model
+    validation permissive by default (no network call). Tests that specifically
+    exercise discovery patch ``litellm_codex_oauth_provider.models`` directly.
+    """
+    from litellm_codex_oauth_provider import models as _models
+
+    _models._cache.update({"models": None, "fetched_at": 0.0})
+    mocker.patch(
+        "litellm_codex_oauth_provider.provider.available_model_slugs",
+        return_value=[],
+    )

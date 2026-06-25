@@ -236,3 +236,19 @@ def test_streaming_wraps_completion_path(mocker: MockerFixture) -> None:
 def test_normalize_model_accepts_codex_prefix() -> None:
     """Given a model name that's already in normalized format, when normalized, then the model name is returned unchanged."""
     assert normalize_model("gpt-5-codex-high") == "gpt-5-codex-high"
+
+
+def test_validate_model_supported_uses_live_discovery(mocker: MockerFixture) -> None:
+    """Given a live model list, when validating, then known slugs pass and unknown ones raise.
+
+    Confirms model validation tracks the account's real models instead of a hard-coded set.
+    """
+    from litellm_codex_oauth_provider.provider import _validate_model_supported
+
+    mocker.patch(
+        "litellm_codex_oauth_provider.provider.available_model_slugs",
+        return_value=["gpt-5.5", "gpt-5.4"],
+    )
+    _validate_model_supported("gpt-5.5")  # known -> no raise
+    with pytest.raises(ValueError, match="not available"):
+        _validate_model_supported("gpt-5.1-codex")
