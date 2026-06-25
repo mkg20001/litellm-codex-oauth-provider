@@ -103,6 +103,10 @@ CODEX_CACHE_META_SUFFIX = "-meta.json"
 # ChatGPT backend (Codex) endpoints and headers
 CODEX_API_BASE_URL = "https://chatgpt.com/backend-api"
 CODEX_RESPONSES_ENDPOINT = "/codex/responses"
+CODEX_MODELS_ENDPOINT = "/codex/models"
+# The /codex/models endpoint requires a client_version query param. Override via
+# the CODEX_CLIENT_VERSION env var to match a newer Codex CLI release.
+CODEX_CLIENT_VERSION = "0.133.0"
 OPENAI_RESPONSES_ENDPOINT = "/responses"
 CODEX_RELEASE_API_URL = "https://api.github.com/repos/openai/codex/releases/latest"
 CODEX_RELEASE_HTML_URL = "https://github.com/openai/codex/releases/latest"

@@ -33,6 +33,7 @@ from .auth import _decode_account_id, get_auth_context
 from .exceptions import CodexAuthTokenExpiredError
 from .http_client import CodexAPIClient
 from .model_map import _strip_provider_prefix, get_model_family, normalize_model
+from .models import available_model_slugs, model_instructions
 from .prompts import DEFAULT_INSTRUCTIONS, build_tool_bridge_message, derive_instructions
 from .reasoning import apply_reasoning_config
 from .remote_resources import fetch_codex_instructions
@@ -142,7 +143,14 @@ def _prepare_common_payload(
     tools = kwargs.get("tools") or optional_params.get("tools")
     normalized_tools = _normalize_tools(tools) if tools else None
 
-    instructions_text = fetch_codex_instructions(normalized_model)
+    # Prefer the canonical base_instructions the backend ships for this model;
+    # fall back to the GitHub-sourced instructions, then to the default.
+    instructions_text = model_instructions(normalized_model)
+    if not instructions_text:
+        try:
+            instructions_text = fetch_codex_instructions(normalized_model)
+        except Exception:  # noqa: BLE001 - unknown model family / offline
+            instructions_text = DEFAULT_INSTRUCTIONS
     instructions, prepared_messages = derive_instructions(
         messages,
         normalized_model=normalized_model,
@@ -204,10 +212,19 @@ def _run_sync(coro: asyncio.Future | asyncio.Awaitable[T]) -> T:
 
 
 def _validate_model_supported(normalized_model: str) -> None:
-    """Ensure the requested model maps to a supported family."""
-    family = get_model_family(normalized_model)
-    if family not in SUPPORTED_FAMILIES:
-        raise ValueError(f"Model '{normalized_model}' not found")
+    """Ensure the requested model is one the account can actually use.
+
+    Validates against the live model list from the Codex backend rather than a
+    hard-coded family set, so new models work without a code change. If discovery
+    is unavailable (empty list), we don't block locally and let the backend
+    reject unknown models.
+    """
+    slugs = available_model_slugs()
+    if slugs and normalized_model not in slugs:
+        raise ValueError(
+            f"Model '{normalized_model}' is not available for this account. "
+            f"Available models: {', '.join(sorted(slugs))}"
+        )
 
 
 def _coerce_reasoning_effort(reasoning_effort: Any | None) -> str | None:
