@@ -6,7 +6,7 @@ reasoning config, and prompt normalization behave as expected.
 from __future__ import annotations
 
 from litellm_codex_oauth_provider.model_map import normalize_model
-from litellm_codex_oauth_provider.prompts import _to_codex_input, derive_instructions
+from litellm_codex_oauth_provider.prompts import _to_codex_input_items, derive_instructions
 from litellm_codex_oauth_provider.reasoning import apply_reasoning_config
 
 
@@ -69,37 +69,162 @@ def test_derive_instructions_filters_legacy_toolchain_prompts() -> None:
 
 
 def test_to_codex_input_user_message() -> None:
-    """Given a user message, when converted, then Codex input schema is produced.
-
-    Checks OpenAI user messages map cleanly to Codex message payloads without metadata.
-    """
+    """A plain user message maps to a single Responses-API ``message`` item."""
     msg = {"role": "user", "content": "Hello", "id": "abc123"}
-    result = _to_codex_input(msg)
-    assert result == {"type": "message", "content": "Hello", "role": "user"}
+    items = _to_codex_input_items(msg)
+    assert items == [{"type": "message", "content": "Hello", "role": "user"}]
 
 
 def test_to_codex_input_tool_call() -> None:
-    """Given a tool call message, when converted, then function_call schema is emitted.
+    """An assistant ``tool_calls`` message emits a ``function_call`` item with
+    ``call_id`` / ``name`` / ``arguments`` at the top level (no nesting)."""
+    msg = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call_xyz",
+                "type": "function",
+                "function": {"name": "foo", "arguments": {"x": 1}},
+            }
+        ],
+    }
+    items = _to_codex_input_items(msg)
 
-    Verifies tool_calls payloads are normalized with JSON-string arguments and correct type.
-    """
-    msg = {"role": "assistant", "tool_calls": [{"name": "foo", "arguments": {"x": 1}}]}
-    result = _to_codex_input(msg)
+    assert items == [
+        {
+            "type": "function_call",
+            "call_id": "call_xyz",
+            "name": "foo",
+            "arguments": '{"x": 1}',
+        }
+    ]
 
-    assert result["type"] == "function_call"
-    assert result["function_call"]["name"] == "foo"
-    assert '"x": 1' in result["function_call"]["arguments"]
+
+def test_to_codex_input_assistant_text_and_tool_call() -> None:
+    """Assistant text + tool_calls emit two items, message first then function_call."""
+    msg = {
+        "role": "assistant",
+        "content": "thinking...",
+        "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+        ],
+    }
+    items = _to_codex_input_items(msg)
+    assert items[0] == {"type": "message", "role": "assistant", "content": "thinking..."}
+    assert items[1] == {
+        "type": "function_call",
+        "call_id": "c1",
+        "name": "f",
+        "arguments": "{}",
+    }
 
 
 def test_to_codex_input_tool_role_output() -> None:
-    """Given a tool role output, when converted, then function_call_output schema is emitted.
-
-    Ensures tool role responses become function_call_output entries with preserved IDs and content.
-    """
+    """A ``role: tool`` message emits a ``function_call_output`` item with
+    ``call_id`` at the top level and ``output`` as a JSON string."""
     msg = {"role": "tool", "tool_call_id": "call-1", "content": {"foo": "bar"}}
 
-    result = _to_codex_input(msg)
+    items = _to_codex_input_items(msg)
 
-    assert result["type"] == "function_call_output"
-    assert result["output"]["tool_call_id"] == "call-1"
-    assert result["output"]["content"] == {"foo": "bar"}
+    assert items == [
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": '{"foo": "bar"}',
+        }
+    ]
+
+
+def test_to_codex_input_legacy_function_call() -> None:
+    """The deprecated single ``function_call`` field still maps to a function_call item."""
+    msg = {
+        "role": "assistant",
+        "content": None,
+        "function_call": {"name": "lookup", "arguments": '{"q":"x"}'},
+        "id": "leg-1",
+    }
+    items = _to_codex_input_items(msg)
+    assert items == [
+        {
+            "type": "function_call",
+            "call_id": "leg-1",
+            "name": "lookup",
+            "arguments": '{"q":"x"}',
+        }
+    ]
+
+
+def test_to_codex_input_multiple_tool_calls() -> None:
+    """Multiple tool_calls in one assistant message produce one function_call item each."""
+    msg = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "a", "arguments": "{}"}},
+            {"id": "c2", "type": "function", "function": {"name": "b", "arguments": '{"k":1}'}},
+        ],
+    }
+    items = _to_codex_input_items(msg)
+    assert [it["call_id"] for it in items] == ["c1", "c2"]
+    assert all(it["type"] == "function_call" for it in items)
+    assert items[1]["arguments"] == '{"k":1}'
+
+
+def test_to_codex_input_tool_output_string() -> None:
+    """A plain-string tool result is forwarded verbatim as ``output``."""
+    msg = {"role": "tool", "tool_call_id": "c1", "content": "hello world"}
+    items = _to_codex_input_items(msg)
+    assert items == [
+        {"type": "function_call_output", "call_id": "c1", "output": "hello world"}
+    ]
+
+
+def test_derive_instructions_round_trip_multi_turn_tool_use() -> None:
+    """End-to-end: a chat-completions multi-turn with a prior tool_call lowers to
+    exactly the item sequence the Responses API requires (this is the shape that
+    used to provoke 'Missing required parameter: input[2].call_id')."""
+    messages = [
+        {"role": "user", "content": "list the cwd"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "shell",
+                        "arguments": '{"command":["ls","."]}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "a.txt\nb.txt"},
+        {"role": "user", "content": "now read b.txt"},
+    ]
+    _instructions, items = derive_instructions(
+        messages, normalized_model="gpt-5.5", instructions_text="x"
+    )
+    assert items == [
+        {"type": "message", "role": "user", "content": "list the cwd"},
+        {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "shell",
+            "arguments": '{"command":["ls","."]}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "a.txt\nb.txt",
+        },
+        {"type": "message", "role": "user", "content": "now read b.txt"},
+    ]
+
+
+def test_to_codex_input_empty_assistant_no_calls() -> None:
+    """A wholly-empty assistant message (no content, no tool_calls) still emits a
+    placeholder so the conversation shape isn't silently lost."""
+    items = _to_codex_input_items({"role": "assistant", "content": None})
+    assert items == [{"type": "message", "role": "assistant", "content": ""}]

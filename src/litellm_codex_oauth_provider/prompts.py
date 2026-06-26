@@ -202,127 +202,107 @@ def _clean_message_payload(message: dict[str, Any]) -> dict[str, Any]:
     return _drop_stray_function_output(stripped)
 
 
-def _extract_tool_call(message: dict[str, Any]) -> dict[str, Any] | None:
-    """Extract the first tool call from a message.
+def _stringify_arguments(arguments: Any) -> str:
+    """Coerce a tool-call arguments payload to a JSON string."""
+    if arguments is None:
+        return ""
+    if isinstance(arguments, str):
+        return arguments
+    return json.dumps(arguments)
 
-    Parameters
-    ----------
-    message : dict[str, Any]
-        Message payload containing optional `tool_calls`.
 
-    Returns
-    -------
-    dict[str, Any] | None
-        Normalized function call payload or ``None`` when absent.
+def _function_call_items(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Emit one Responses-API ``function_call`` item per chat-completions tool call.
+
+    The Responses API requires ``call_id``, ``name`` and ``arguments`` at the top
+    level of each ``function_call`` item -- not nested under a ``function_call``
+    or ``function`` key. Chat-completions assistant messages carry these as
+    ``tool_calls: [{id, type:"function", function:{name, arguments}}, ...]`` (and
+    historically as a single legacy ``function_call: {name, arguments}`` field).
     """
-    tool_calls = message.get("tool_calls")
-    if not tool_calls:
-        return None
+    items: list[dict[str, Any]] = []
+    for tc in message.get("tool_calls") or []:
+        if not isinstance(tc, dict):
+            continue
+        # New shape: {id, type:"function", function:{name, arguments}}.
+        # Legacy/flat shape: {id, name, arguments}.
+        fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+        items.append(
+            {
+                "type": "function_call",
+                "call_id": tc.get("id") or tc.get("call_id"),
+                "name": fn.get("name"),
+                "arguments": _stringify_arguments(fn.get("arguments")),
+            }
+        )
+    legacy = message.get("function_call")
+    if isinstance(legacy, dict):
+        items.append(
+            {
+                "type": "function_call",
+                "call_id": message.get("id") or message.get("call_id"),
+                "name": legacy.get("name"),
+                "arguments": _stringify_arguments(legacy.get("arguments")),
+            }
+        )
+    return items
 
-    tool_call = tool_calls[0]
-    if isinstance(tool_call, dict):
-        arguments = tool_call.get("arguments", "")
-        if isinstance(arguments, (dict, list)):
-            arguments = json.dumps(arguments)
-        return {
-            "name": tool_call.get("name"),
-            "arguments": arguments,
-        }
-    return None
 
+def _function_call_output_item(message: dict[str, Any]) -> dict[str, Any] | None:
+    """Emit a ``function_call_output`` item for a tool-role message.
 
-def _normalize_function_output(message: dict[str, Any]) -> dict[str, Any] | None:
-    """Convert tool role messages to Codex function_call_output schema.
-
-    Parameters
-    ----------
-    message : dict[str, Any]
-        Tool role message from OpenAI chat history.
-
-    Returns
-    -------
-    dict[str, Any] | None
-        Codex function_call_output structure or ``None`` if not applicable.
+    The Responses API expects ``call_id`` (top level) and ``output`` as a string.
+    ``role`` is *not* a valid field on this item type.
     """
     if message.get("role") != "tool":
         return None
-    tool_call_id = message.get("tool_call_id")
     output = message.get("content")
-    if tool_call_id is not None:
-        output = {"tool_call_id": tool_call_id, "content": output}
+    if isinstance(output, (dict, list)):
+        # Structured tool outputs go to the wire as JSON strings.
+        output = json.dumps(output)
+    elif not isinstance(output, str):
+        output = _coerce_text(output)
     return {
         "type": "function_call_output",
+        "call_id": message.get("tool_call_id") or message.get("call_id"),
         "output": output,
-        "role": message.get("role", "assistant"),
     }
 
 
-def _normalize_function_call(message: dict[str, Any]) -> dict[str, Any] | None:
-    """Normalize function call payloads into Codex schema.
+def _to_codex_input_items(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Convert one chat-completions message to one-or-more Responses-API input items.
 
-    Parameters
-    ----------
-    message : dict[str, Any]
-        Assistant message containing function call information.
-
-    Returns
-    -------
-    dict[str, Any] | None
-        Codex-compatible function call payload or ``None`` when not present.
+    Tool calls and tool results map to dedicated item types; assistant text and
+    tool calls in the same message both get emitted (the message item first, then
+    the function_call items, matching the order the model produced them).
     """
-    tool_call = _extract_tool_call(message)
-    if tool_call:
-        return {
-            "type": "function_call",
-            "function_call": tool_call,
-            "role": message.get("role", "assistant"),
-        }
-    if "function_call_output" in message:
-        return {
-            "type": "function_call_output",
-            "output": message["function_call_output"],
-            "role": message.get("role", "assistant"),
-        }
-    if "function_call" in message:
-        return {
-            "type": "function_call",
-            "function_call": message["function_call"],
-            "role": message.get("role", "assistant"),
-        }
-    return None
+    fco = _function_call_output_item(message)
+    if fco is not None:
+        return [fco]
 
-
-def _to_codex_input(message: dict[str, Any]) -> dict[str, Any]:
-    """Convert a message to Codex input format.
-
-    Parameters
-    ----------
-    message : dict
-        Message payload.
-
-    Returns
-    -------
-    dict
-        Codex input schema.
-
-    Examples
-    --------
-    >>> _to_codex_input({"role": "user", "content": "Hello"})
-    {'type': 'message', 'content': 'Hello', 'role': 'user'}
-    """
-    function_output = _normalize_function_output(message)
-    if function_output:
-        return function_output
-
-    normalized_function_call = _normalize_function_call(message)
-    if normalized_function_call:
-        return normalized_function_call
-
-    return {
-        "type": "message",
-        "content": message.get("content"),
-        "role": message.get("role", "user"),
-    }
+    items: list[dict[str, Any]] = []
+    content = message.get("content")
+    has_text = content not in (None, "", [])
+    if has_text:
+        items.append(
+            {
+                "type": "message",
+                "role": message.get("role", "user"),
+                "content": content,
+            }
+        )
+    items.extend(_function_call_items(message))
+    if not items:
+        # Empty assistant message (e.g. content=None with no tool calls): still
+        # emit a placeholder so the conversation shape is preserved.
+        items.append(
+            {
+                "type": "message",
+                "role": message.get("role", "user"),
+                "content": "",
+            }
+        )
+    return items
 
 
 def derive_instructions(
@@ -362,7 +342,7 @@ def derive_instructions(
             continue
 
         cleaned = _clean_message_payload(message)
-        input_payload.append(_to_codex_input(cleaned))
+        input_payload.extend(_to_codex_input_items(cleaned))
 
     base_instructions = instructions_text or DEFAULT_INSTRUCTIONS
     instructions_parts: list[str] = [base_instructions, *system_parts]
