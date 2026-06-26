@@ -137,12 +137,15 @@ class CodexAPIClient:
                 json=payload_with_stream,
                 headers=headers,
             )
-            response.raise_for_status()
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"Codex API returned HTTP {response.status_code} for {url}: "
+                    f"{response.text[:8192]}"
+                )
             return self._parse_response(response)
 
-        except httpx.HTTPStatusError as exc:
-            # Let HTTP errors bubble up with context
-            raise exc
+        except RuntimeError:
+            raise
         except Exception as exc:
             # Wrap other exceptions for clarity
             raise RuntimeError(f"Failed to communicate with Codex API: {exc}") from exc
@@ -169,12 +172,15 @@ class CodexAPIClient:
                 json=payload_with_stream,
                 headers=headers,
             )
-            response.raise_for_status()
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"Codex API returned HTTP {response.status_code} for {url}: "
+                    f"{response.text[:8192]}"
+                )
             return await self._parse_response_async(response)
 
-        except httpx.HTTPStatusError as exc:
-            # Let HTTP errors bubble up with context
-            raise exc
+        except RuntimeError:
+            raise
         except Exception as exc:
             # Wrap other exceptions for clarity
             raise RuntimeError(f"Failed to communicate with Codex API: {exc}") from exc
@@ -226,13 +232,28 @@ class CodexAPIClient:
                 json=payload_with_stream,
                 headers=headers,
             ) as response:
-                response.raise_for_status()
+                if response.status_code >= 400:
+                    # On a streaming request the body isn't read by raise_for_status,
+                    # so the API's actual error message would be discarded. Read it
+                    # explicitly and attach it to the raised RuntimeError so callers
+                    # (and logs) see WHY the backend rejected the request.
+                    body_bytes = b""
+                    try:
+                        async for chunk in response.aiter_bytes():
+                            body_bytes += chunk
+                            if len(body_bytes) >= 8192:
+                                break
+                    except Exception:  # noqa: BLE001
+                        pass
+                    body_text = body_bytes.decode("utf-8", "replace").strip()
+                    raise RuntimeError(
+                        f"Codex API returned HTTP {response.status_code} for {url}: {body_text}"
+                    )
                 async for event in parse_sse_events(response):
                     yield event
 
-        except httpx.HTTPStatusError as exc:
-            # Let HTTP errors bubble up with context
-            raise exc
+        except RuntimeError:
+            raise
         except Exception as exc:
             # Wrap other exceptions for clarity
             raise RuntimeError(f"Failed to communicate with Codex API: {exc}") from exc
