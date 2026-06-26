@@ -65,6 +65,44 @@ class TestSSEMessageParsing:
         assert done_event is not None
         assert done_event["type"] == "done"
 
+    def test_function_call_started_extracts_name_and_call_id(self) -> None:
+        """``response.output_item.added`` for a function_call item normalizes to
+        ``function_call_started`` and exposes the name + call_id (not just item_id).
+
+        Without this, downstream arg-delta events have no way to learn the tool
+        name and the chunk would be emitted with name="unknown"."""
+        data = {
+            "type": "response.output_item.added",
+            "item": {
+                "id": "fc_xyz",
+                "type": "function_call",
+                "call_id": "call_abc",
+                "name": "shell",
+                "arguments": "",
+            },
+            "output_index": 1,
+        }
+        event = _normalize_event("response.output_item.added", data)
+
+        assert event is not None
+        assert event["type"] == "function_call_started"
+        assert event["item_id"] == "fc_xyz"
+        assert event["call_id"] == "call_abc"
+        assert event["name"] == "shell"
+
+    def test_output_item_added_for_message_does_not_become_tool_start(self) -> None:
+        """``response.output_item.added`` is also emitted for message and reasoning
+        items; only function_call items become ``function_call_started``."""
+        data = {
+            "type": "response.output_item.added",
+            "item": {"id": "msg_1", "type": "message", "role": "assistant"},
+            "output_index": 0,
+        }
+        event = _normalize_event("response.output_item.added", data)
+
+        assert event is not None
+        assert event["type"] != "function_call_started"
+
 
 class TestStreamingChunkBuilding:
     """Test streaming chunk construction utilities."""

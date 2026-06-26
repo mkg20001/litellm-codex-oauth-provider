@@ -121,6 +121,56 @@ def test_completion_builds_model_response(
     assert result.choices[0].message.content == "hi"
 
 
+def test_streaming_tool_call_chunks_carry_real_name(provider: CodexAuthProvider) -> None:
+    """End-to-end SSE -> chunk: the chunk's ``function.name`` is the real tool
+    name from ``response.output_item.added`` -- not the literal "unknown" the
+    old code emitted when the name only existed on the start event."""
+    from litellm_codex_oauth_provider.streaming_utils import ToolCallTracker
+
+    tracker = ToolCallTracker()
+
+    started = {
+        "type": "function_call_started",
+        "item_id": "fc_1",
+        "call_id": "call_abc",
+        "name": "shell",
+    }
+    delta = {
+        "type": "function_arguments_delta",
+        "item_id": "fc_1",
+        "delta": '{"command":["ls"]}',
+        "data": {"delta": '{"command":["ls"]}', "item_id": "fc_1"},
+    }
+
+    open_chunk = provider._process_sse_streaming_event(started, tracker)  # noqa: SLF001
+    assert open_chunk is not None
+    assert open_chunk["tool_use"]["id"] == "call_abc"
+    assert open_chunk["tool_use"]["function"]["name"] == "shell"
+
+    arg_chunk = provider._process_sse_streaming_event(delta, tracker)  # noqa: SLF001
+    assert arg_chunk is not None
+    assert arg_chunk["tool_use"]["id"] == "call_abc"
+    assert arg_chunk["tool_use"]["function"]["name"] == "shell"
+    assert arg_chunk["tool_use"]["function"]["arguments"] == '{"command":["ls"]}'
+
+
+def test_streaming_tool_call_without_start_event_is_dropped(
+    provider: CodexAuthProvider,
+) -> None:
+    """An arg-delta with no preceding start event has no real name/call_id, so
+    we drop the chunk rather than emit ``name="unknown"`` to the client."""
+    from litellm_codex_oauth_provider.streaming_utils import ToolCallTracker
+
+    tracker = ToolCallTracker()
+    delta = {
+        "type": "function_arguments_delta",
+        "item_id": "fc_unknown",
+        "delta": "{}",
+        "data": {"delta": "{}", "item_id": "fc_unknown"},
+    }
+    assert provider._process_sse_streaming_event(delta, tracker) is None  # noqa: SLF001
+
+
 def test_normalize_tools_handles_function_name() -> None:
     """Given tool definitions with function specifications, when normalized, then required fields are filled and valid structure is enforced."""
     tools = _normalize_tools(

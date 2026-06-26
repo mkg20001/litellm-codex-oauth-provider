@@ -486,6 +486,9 @@ class CodexAuthProvider(CustomLLM):
         handlers: dict[str, Any] = {
             "text_delta": self._build_text_chunk_from_event,
             "reasoning_delta": self._build_reasoning_chunk_from_event,
+            "function_call_started": lambda evt: self._handle_tool_call_started(
+                evt, tool_tracker
+            ),
             "function_arguments_delta": lambda evt: self._build_tool_chunk_from_event(
                 evt, tool_tracker
             ),
@@ -512,6 +515,24 @@ class CodexAuthProvider(CustomLLM):
             return None
         return build_reasoning_chunk(reasoning_delta)
 
+    def _handle_tool_call_started(
+        self, event: dict[str, Any], tool_tracker: ToolCallTracker
+    ) -> GenericStreamingChunk | None:
+        """Record the tool name + call_id from ``response.output_item.added``.
+
+        The delta events that follow only carry ``item_id``, so without this
+        bookkeeping the downstream chunk would be tagged with the placeholder
+        ``name="unknown"``. Yields one chunk so the client sees the tool call
+        opened (with empty arguments) before the arguments stream in.
+        """
+        item_id = event.get("item_id")
+        call_id = event.get("call_id")
+        name = event.get("name")
+        if not item_id or not call_id or not name:
+            return None
+        tool_tracker.start_tool_call(item_id, name, call_id=call_id)
+        return build_tool_call_chunk(call_id, name, "")
+
     def _build_tool_chunk_from_event(
         self, event: dict[str, Any], tool_tracker: ToolCallTracker
     ) -> GenericStreamingChunk | None:
@@ -519,17 +540,17 @@ class CodexAuthProvider(CustomLLM):
         if not tool_data:
             return None
 
-        call_id = tool_data.get("call_id") or "unknown"
+        # Argument-delta events from the Responses API are keyed by ``item_id``;
+        # the chat-completions chunk needs the real ``call_id`` + ``name``, which
+        # were captured earlier in _handle_tool_call_started.
+        item_id = event.get("item_id") or tool_data.get("call_id")
         arguments = tool_data.get("arguments", "")
-        name = tool_data.get("name")
+        active = tool_tracker.get_active_calls().get(item_id) if item_id else None
+        if not active:
+            return None
 
-        if call_id not in tool_tracker.get_active_calls():
-            tool_tracker.start_tool_call(call_id, name or "unknown")
-
-        tool_tracker.add_arguments_delta(call_id, arguments)
-
-        tracked_name = tool_tracker.get_active_calls().get(call_id, {}).get("name", "unknown")
-        return build_tool_call_chunk(call_id, name or tracked_name, arguments)
+        tool_tracker.add_arguments_delta(item_id, arguments)
+        return build_tool_call_chunk(active["call_id"], active["name"], arguments)
 
     def _build_completion_chunk_from_event(self, event: dict[str, Any]) -> GenericStreamingChunk:
         usage = event.get("usage") or {}
@@ -585,8 +606,11 @@ class CodexAuthProvider(CustomLLM):
             Accumulated text, tool calls, usage data, and finish reason
         """
         accumulated_text = ""
-        tool_calls = []
-        usage = {}
+        tool_calls: list[dict[str, Any]] = []
+        # item_id -> (call_id, name). Populated by function_call_started events;
+        # used to enrich the otherwise-anonymous delta events.
+        tool_starts: dict[str, tuple[str, str]] = {}
+        usage: dict[str, int] = {}
         finish_reason = "stop"
 
         try:
@@ -597,9 +621,20 @@ class CodexAuthProvider(CustomLLM):
                     text = extract_text_from_sse_event(event)
                     if text:
                         accumulated_text += text
+                elif event_type == "function_call_started":
+                    item_id = event.get("item_id")
+                    call_id = event.get("call_id")
+                    name = event.get("name")
+                    if item_id and call_id and name:
+                        tool_starts[item_id] = (call_id, name)
                 elif event_type == "function_arguments_delta":
                     tool_data = extract_tool_call_from_sse_event(event)
                     if tool_data:
+                        item_id = event.get("item_id")
+                        start = tool_starts.get(item_id) if item_id else None
+                        if start:
+                            tool_data["call_id"] = start[0]
+                            tool_data["name"] = start[1]
                         tool_calls.append(tool_data)
                 elif event_type == "completion":
                     usage, finish_reason = self._extract_completion_metadata(

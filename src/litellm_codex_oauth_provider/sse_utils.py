@@ -24,6 +24,8 @@ class SSEEvent(TypedDict, total=False):
     id: str | None
     delta: NotRequired[str | None]
     item_id: NotRequired[str | None]
+    call_id: NotRequired[str | None]
+    name: NotRequired[str | None]
     finish_reason: NotRequired[str | None]
     usage: NotRequired[dict[str, Any] | None]
 
@@ -45,6 +47,10 @@ _FUNCTION_ARGUMENTS_TYPES = {
     "function_call",
     "response.function_call_arguments.delta",
 }
+# response.output_item.added wraps an item that may be a message, reasoning,
+# or function_call. We can only treat it as a tool-call start when item.type
+# is "function_call" -- handled in _resolve_normalized_type below.
+_FUNCTION_CALL_START_RAW = "response.output_item.added"
 _COMPLETION_EVENT_TYPES = {"response.done", "response.completed", "completed", "response"}
 
 
@@ -90,13 +96,22 @@ def _resolve_raw_type(event_type: str | None, data: Any) -> str | None:
     return None
 
 
-def _resolve_normalized_type(raw_type: str | None) -> str:
+def _resolve_normalized_type(raw_type: str | None, data: Any = None) -> str:
     if raw_type in _TEXT_EVENT_TYPES:
         return "text_delta"
     if raw_type in _REASONING_EVENT_TYPES:
         return "reasoning_delta"
     if raw_type in _FUNCTION_ARGUMENTS_TYPES:
         return "function_arguments_delta"
+    if raw_type == _FUNCTION_CALL_START_RAW:
+        # Only treat as a tool-call start when the wrapped item is a function_call.
+        # output_item.added is also emitted for message and reasoning items, which
+        # the rest of the pipeline handles via their own text/reasoning deltas.
+        if isinstance(data, dict):
+            item = data.get("item")
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                return "function_call_started"
+        return "unknown"
     if raw_type in _COMPLETION_EVENT_TYPES:
         return "completion"
     return raw_type or "unknown"
@@ -113,6 +128,29 @@ def _attach_delta_metadata(event: SSEEvent, data: Any, normalized_type: str) -> 
         item_id = data.get("item_id") or data.get("item", {}).get("id")
         if item_id:
             event["item_id"] = item_id
+
+
+def _attach_function_call_start_metadata(
+    event: SSEEvent, data: Any, normalized_type: str
+) -> None:
+    """Surface call_id / name / item_id from a ``response.output_item.added``
+    event whose item is a ``function_call``.
+
+    The argument-delta events that follow only carry ``item_id`` + ``delta`` --
+    the name and call_id are *only* available on the start event, so the
+    provider has to grab them here or downstream tool calls will be tagged
+    with the placeholder name ``"unknown"``.
+    """
+    if normalized_type != "function_call_started":
+        return
+    if not isinstance(data, dict):
+        return
+    item = data.get("item")
+    if not isinstance(item, dict):
+        return
+    event["item_id"] = item.get("id")
+    event["call_id"] = item.get("call_id")
+    event["name"] = item.get("name")
 
 
 def _attach_completion_metadata(event: SSEEvent, data: Any, normalized_type: str) -> None:
@@ -135,7 +173,7 @@ def _normalize_event(
     if isinstance(data, str) and data.strip() == "[DONE]":
         return SSEEvent(type="done", raw_type=raw_type, data=None, id=event_id)
 
-    normalized_type = _resolve_normalized_type(raw_type)
+    normalized_type = _resolve_normalized_type(raw_type, data)
 
     event: SSEEvent = {
         "type": normalized_type,
@@ -146,6 +184,7 @@ def _normalize_event(
 
     _attach_delta_metadata(event, data, normalized_type)
     _attach_completion_metadata(event, data, normalized_type)
+    _attach_function_call_start_metadata(event, data, normalized_type)
 
     if normalized_type == "unknown":
         logger.debug("Unhandled SSE event type", extra={"event_type": raw_type, "data": data})

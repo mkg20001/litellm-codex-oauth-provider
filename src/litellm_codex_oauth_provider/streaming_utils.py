@@ -238,17 +238,25 @@ class ToolCallTracker:
     def __init__(self) -> None:
         self._active_calls: dict[str, dict[str, str]] = {}
 
-    def start_tool_call(self, call_id: str, name: str) -> None:
+    def start_tool_call(self, key: str, name: str, call_id: str | None = None) -> None:
         """Start tracking a new tool call.
 
         Parameters
         ----------
-        call_id : str
-            Unique identifier for the tool call
+        key : str
+            Tracker lookup key. For Responses-API streaming this is the
+            ``item_id`` (the only id carried on argument-delta events).
         name : str
-            Name of the function being called
+            Name of the function being called.
+        call_id : str | None
+            Tool-call id surfaced to chat-completions clients (``tool_call.id``).
+            Defaults to ``key`` when callers don't have a separate value.
         """
-        self._active_calls[call_id] = {"name": name, "arguments": ""}
+        self._active_calls[key] = {
+            "name": name,
+            "arguments": "",
+            "call_id": call_id or key,
+        }
 
     def add_arguments_delta(self, call_id: str, arguments_delta: str) -> None:
         """Add incremental arguments to a tool call.
@@ -282,7 +290,7 @@ class ToolCallTracker:
         call_data = self._active_calls.pop(call_id)
 
         return ChatCompletionToolCallChunk(
-            id=call_id,
+            id=call_data.get("call_id", call_id),
             type="function",
             index=0,  # Simplified for now
             function=ChatCompletionToolCallFunctionChunk(
