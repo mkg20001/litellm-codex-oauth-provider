@@ -269,6 +269,37 @@ def _function_call_output_item(message: dict[str, Any]) -> dict[str, Any] | None
     }
 
 
+def _to_responses_content(content: Any, role: str) -> Any:
+    """Convert chat-completions message content to Responses-API content.
+
+    Chat-completions part types (``text``, ``image_url``) are rejected by the
+    Responses API, which requires ``input_text``/``input_image``/``input_file``
+    for input roles (user/system/developer) and ``output_text`` for assistant
+    text. A plain string is accepted as-is, so it passes through unchanged; a
+    list of parts is remapped part-by-part.
+    """
+    if not isinstance(content, list):
+        return content
+    text_type = "output_text" if role == "assistant" else "input_text"
+    parts: list[Any] = []
+    for part in content:
+        if not isinstance(part, dict):
+            parts.append({"type": text_type, "text": _coerce_text(part)})
+            continue
+        ptype = part.get("type")
+        if ptype in ("text", "input_text", "output_text"):
+            parts.append({"type": text_type, "text": part.get("text", "")})
+        elif ptype in ("image_url", "input_image"):
+            image_url = part.get("image_url", part.get("url"))
+            if isinstance(image_url, dict):
+                image_url = image_url.get("url")
+            parts.append({"type": "input_image", "image_url": image_url})
+        else:
+            # Already Responses-shaped (e.g. input_file) or unknown: pass through.
+            parts.append(part)
+    return parts
+
+
 def _to_codex_input_items(message: dict[str, Any]) -> list[dict[str, Any]]:
     """Convert one chat-completions message to one-or-more Responses-API input items.
 
@@ -282,13 +313,14 @@ def _to_codex_input_items(message: dict[str, Any]) -> list[dict[str, Any]]:
 
     items: list[dict[str, Any]] = []
     content = message.get("content")
+    role = message.get("role", "user")
     has_text = content not in (None, "", [])
     if has_text:
         items.append(
             {
                 "type": "message",
-                "role": message.get("role", "user"),
-                "content": content,
+                "role": role,
+                "content": _to_responses_content(content, role),
             }
         )
     items.extend(_function_call_items(message))
