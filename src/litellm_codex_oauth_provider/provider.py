@@ -256,6 +256,72 @@ def _coerce_reasoning_effort(reasoning_effort: Any | None) -> str | None:
     return normalized
 
 
+def _sanitize_tool_schema(schema: Any) -> tuple[Any, bool]:
+    """Normalize a JSON-Schema fragment for Codex's ``/responses`` backend.
+
+    When a function is marked ``strict``, the backend rejects any schema node
+    that lacks a ``type`` key (``"schema must have a 'type' key"``). We infer the
+    unambiguous cases -- a node with ``properties`` is an object, one with
+    ``items`` is an array -- so almost-compliant schemas keep their strictness.
+    A node that stays typeless is irreducibly free-form ("any JSON value") and
+    simply cannot be expressed under strict validation; we report that so the
+    caller can drop ``strict`` and let the backend's lenient path accept it
+    (verified: the same typeless schema succeeds without ``strict``).
+
+    Returns the (rewritten) schema and whether it is strict-compatible. Pure:
+    the input is copied, never mutated.
+    """
+    if isinstance(schema, list):
+        out, strict_ok = [], True
+        for item in schema:
+            new_item, ok = _sanitize_tool_schema(item)
+            out.append(new_item)
+            strict_ok = strict_ok and ok
+        return out, strict_ok
+
+    if not isinstance(schema, Mapping):
+        return schema, True
+
+    result = dict(schema)
+    strict_ok = True
+
+    for key in ("properties", "patternProperties", "$defs", "definitions"):
+        node = result.get(key)
+        if isinstance(node, Mapping):
+            new_node = {}
+            for name, sub in node.items():
+                new_node[name], ok = _sanitize_tool_schema(sub)
+                strict_ok = strict_ok and ok
+            result[key] = new_node
+
+    for key in ("anyOf", "oneOf", "allOf", "prefixItems"):
+        if isinstance(result.get(key), list):
+            result[key], ok = _sanitize_tool_schema(result[key])
+            strict_ok = strict_ok and ok
+
+    if "items" in result:
+        result["items"], ok = _sanitize_tool_schema(result["items"])
+        strict_ok = strict_ok and ok
+
+    if isinstance(result.get("additionalProperties"), Mapping):
+        result["additionalProperties"], ok = _sanitize_tool_schema(result["additionalProperties"])
+        strict_ok = strict_ok and ok
+
+    # Fill in an unambiguous type where one is missing; a combinator node
+    # (anyOf/oneOf/allOf) legitimately carries its type in the branches, and a
+    # $ref defers to the referenced schema -- neither needs a type of its own.
+    if "type" not in result and "$ref" not in result:
+        if any(k in result for k in ("properties", "patternProperties", "additionalProperties")):
+            result["type"] = "object"
+        elif "items" in result or "prefixItems" in result:
+            result["type"] = "array"
+        elif not any(k in result for k in ("anyOf", "oneOf", "allOf")):
+            # No type and nothing to infer from: irreducibly free-form.
+            strict_ok = False
+
+    return result, strict_ok
+
+
 def _normalize_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
     """Normalize tool definitions to OpenAI-compliant schema.
 
@@ -305,6 +371,17 @@ def _normalize_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]
             raise ValueError("Each tool must include name")
         else:
             tool_dict.setdefault("type", "function")
+
+        # Codex rejects strict functions whose parameter schema has any typeless
+        # node. Fill in inferable types; if the schema is still not strict-safe
+        # (a free-form param), drop strict so the backend's lenient path accepts
+        # it instead of returning HTTP 400 invalid_function_parameters.
+        params = tool_dict.get("parameters")
+        if isinstance(params, Mapping):
+            sanitized, strict_ok = _sanitize_tool_schema(params)
+            tool_dict["parameters"] = sanitized
+            if not strict_ok and tool_dict.get("strict"):
+                tool_dict["strict"] = False
 
         normalized.append(tool_dict)
 
