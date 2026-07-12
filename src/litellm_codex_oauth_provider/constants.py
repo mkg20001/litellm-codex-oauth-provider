@@ -116,6 +116,9 @@ OPENAI_BETA_HEADER = "OpenAI-Beta"
 OPENAI_BETA_VALUE = "responses=experimental"
 OPENAI_ORIGINATOR_HEADER = "originator"
 OPENAI_ORIGINATOR_VALUE = "codex_cli_rs"
+# The /codex/responses endpoint hides models newer than the reported client
+# version (404 "Model not found") -- the codex CLI sends its version here.
+VERSION_HEADER = "version"
 SESSION_ID_HEADER = "session_id"
 CONVERSATION_ID_HEADER = "conversation_id"
 REASONING_INCLUDE_TARGET = "reasoning.encrypted_content"

@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from . import constants
+from .models import _client_version
 from .sse_utils import parse_sse_events
 
 if TYPE_CHECKING:
@@ -91,6 +92,9 @@ class CodexAPIClient:
             "Authorization": f"Bearer {self.token_provider()}",
             constants.OPENAI_BETA_HEADER: constants.OPENAI_BETA_VALUE,
             constants.OPENAI_ORIGINATOR_HEADER: constants.OPENAI_ORIGINATOR_VALUE,
+            # Without this the backend 404s ("Model not found") on any model
+            # newer than what it assumes for an unversioned client.
+            constants.VERSION_HEADER: _client_version(),
         }
 
         # Add account ID if available
