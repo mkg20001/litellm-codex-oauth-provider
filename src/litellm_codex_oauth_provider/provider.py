@@ -37,7 +37,11 @@ from .models import available_model_slugs, model_instructions
 from .prompts import DEFAULT_INSTRUCTIONS, build_tool_bridge_message, derive_instructions
 from .reasoning import apply_reasoning_config
 from .remote_resources import fetch_codex_instructions
-from .sse_utils import extract_text_from_sse_event, extract_tool_call_from_sse_event
+from .sse_utils import (
+    extract_text_from_sse_event,
+    extract_tool_call_from_sse_event,
+    normalize_usage,
+)
 from .streaming_utils import (
     ToolCallTracker,
     build_final_chunk,
@@ -645,7 +649,7 @@ class CodexAuthProvider(CustomLLM):
             usage = data.get("usage", usage)
             finish_reason = data.get("finish_reason", finish_reason)
 
-        return build_final_chunk(usage, finish_reason)
+        return build_final_chunk(normalize_usage(usage), finish_reason)
 
     def _extract_completion_metadata(
         self, event: dict[str, Any], usage: dict[str, int], finish_reason: str
@@ -665,7 +669,7 @@ class CodexAuthProvider(CustomLLM):
             usage_value = data.get("usage", usage_value)
             finish_value = data.get("finish_reason", finish_value)
 
-        return usage_value, finish_value
+        return normalize_usage(usage_value), finish_value
 
     async def _process_sse_events(
         self, event_stream: AsyncIterator[dict[str, Any]]

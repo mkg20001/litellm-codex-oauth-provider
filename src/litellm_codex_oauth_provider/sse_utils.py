@@ -71,6 +71,26 @@ def _extract_delta(payload: Any) -> str | None:
     return None
 
 
+def normalize_usage(usage: dict[str, Any] | None) -> dict[str, int]:
+    """Map Responses-API token counters onto chat-completions usage keys.
+
+    The Codex backend reports ``input_tokens``/``output_tokens``, but litellm's
+    ``Usage`` (and downstream cost tracking) reads ``prompt_tokens``/
+    ``completion_tokens`` -- without this mapping both splits silently become 0
+    and spend is tracked as $0. Accept either naming.
+    """
+    if not usage:
+        return {}
+    prompt = usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0
+    completion = usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
+    total = usage.get("total_tokens") or (prompt + completion)
+    return {
+        "prompt_tokens": int(prompt),
+        "completion_tokens": int(completion),
+        "total_tokens": int(total),
+    }
+
+
 def _extract_usage_and_finish(payload: Any) -> tuple[dict[str, Any] | None, str | None]:
     if not isinstance(payload, dict):
         return None, None
