@@ -35,6 +35,14 @@ FETCH_TIMEOUT_SECONDS = 20.0
 # needs *a* plausible image MIME to parse the data URL.
 DEFAULT_IMAGE_MIME = "image/jpeg"
 
+# CDNs commonly reject library-default user agents (Wikimedia 403s
+# "python-httpx/x.y" outright); a descriptive UA with a contact URL satisfies
+# their bot policies.
+USER_AGENT = (
+    "Mozilla/5.0 (compatible; litellm-codex-oauth-provider/0.3; "
+    "+https://github.com/mkg20001/litellm-codex-oauth-provider)"
+)
+
 
 def _is_remote_url(value: Any) -> bool:
     return isinstance(value, str) and value.startswith(("http://", "https://"))
@@ -77,7 +85,9 @@ async def inline_remote_images(input_items: list[dict[str, Any]]) -> None:
     if not parts:
         return
     async with httpx.AsyncClient(
-        timeout=FETCH_TIMEOUT_SECONDS, follow_redirects=True
+        timeout=FETCH_TIMEOUT_SECONDS,
+        follow_redirects=True,
+        headers={"User-Agent": USER_AGENT},
     ) as client:
         for part in parts:
             url = part["image_url"]
