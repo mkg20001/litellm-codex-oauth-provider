@@ -291,9 +291,14 @@ def _to_responses_content(content: Any, role: str) -> Any:
             parts.append({"type": text_type, "text": part.get("text", "")})
         elif ptype in ("image_url", "input_image"):
             image_url = part.get("image_url", part.get("url"))
+            detail = part.get("detail")
             if isinstance(image_url, dict):
+                detail = image_url.get("detail") or detail
                 image_url = image_url.get("url")
-            parts.append({"type": "input_image", "image_url": image_url})
+            image_part: dict[str, Any] = {"type": "input_image", "image_url": image_url}
+            if detail:
+                image_part["detail"] = detail
+            parts.append(image_part)
         else:
             # Already Responses-shaped (e.g. input_file) or unknown: pass through.
             parts.append(part)

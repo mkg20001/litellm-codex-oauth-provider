@@ -32,6 +32,7 @@ from . import constants
 from .auth import _decode_account_id, get_auth_context
 from .exceptions import CodexAuthTokenExpiredError
 from .http_client import CodexAPIClient
+from .images import inline_remote_images
 from .model_map import _strip_provider_prefix, get_model_family, normalize_model
 from .models import available_model_slugs, model_instructions
 from .prompts import DEFAULT_INSTRUCTIONS, build_tool_bridge_message, derive_instructions
@@ -504,6 +505,9 @@ class CodexAuthProvider(CustomLLM):
     ) -> ModelResponse:
         """Complete a chat completion request using Codex authentication with SSE accumulation."""
         payload, normalized_model = _prepare_common_payload(model, messages, **kwargs)
+        # Vision: the backend can't reliably fetch arbitrary public URLs, so
+        # inline remote images as data URLs before sending (see images.py).
+        await inline_remote_images(payload["input"])
 
         # Process SSE events and build response
         accumulated_text, tool_calls, usage, finish_reason = await self._process_sse_events(
@@ -535,6 +539,7 @@ class CodexAuthProvider(CustomLLM):
     ) -> AsyncIterator[GenericStreamingChunk]:
         """True streaming method that yields SSE events as streaming chunks."""
         payload, _normalized_model = _prepare_common_payload(model, messages, **kwargs)
+        await inline_remote_images(payload["input"])
         tool_tracker = ToolCallTracker()
 
         try:
