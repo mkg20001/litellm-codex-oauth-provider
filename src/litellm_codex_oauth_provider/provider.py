@@ -26,7 +26,7 @@ from threading import Thread
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from litellm import Choices, CustomLLM, Message, ModelResponse
-from litellm.types.utils import Usage
+from litellm.types.utils import ImageObject, ImageResponse, Usage
 
 from . import constants
 from .auth import _decode_account_id, get_auth_context
@@ -58,6 +58,15 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 VALID_REASONING = {"none", "minimal", "low", "medium", "high", "xhigh"}
 SUPPORTED_FAMILIES = {"codex", "codex-max", "codex-mini", "gpt-5.1"}
+
+# Image generation: the backend supports the Responses-API image_generation
+# tool (verified: /responses streams image_generation_call items whose
+# `result` is base64 PNG). These optional_params forward onto the tool spec.
+IMAGE_TOOL_PARAM_KEYS = ("size", "quality", "output_format", "background")
+IMAGE_GEN_INSTRUCTIONS = (
+    "You are an image generation assistant. Call the image_generation tool "
+    "exactly once to produce the image the user describes. Do not answer in text."
+)
 
 
 # Internal utility functions for pure logic operations
@@ -550,6 +559,76 @@ class CodexAuthProvider(CustomLLM):
         except Exception as exc:
             logger.error(f"Error during SSE streaming: {exc}")
             raise RuntimeError(f"Failed to stream Codex response: {exc}") from exc
+
+    def image_generation(
+        self,
+        model: str,
+        prompt: str,
+        **kwargs: Any,
+    ) -> ImageResponse:
+        """Sync wrapper that delegates to async image generation."""
+        return _run_sync(self.aimage_generation(model, prompt, **kwargs))
+
+    async def aimage_generation(
+        self,
+        model: str,
+        prompt: str,
+        model_response: ImageResponse | None = None,
+        optional_params: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> ImageResponse:
+        """Generate an image via the Responses-API ``image_generation`` tool.
+
+        The Codex backend has no dedicated images endpoint; instead a normal
+        ``/responses`` call with the hosted ``image_generation`` tool streams
+        ``image_generation_call`` output items whose ``result`` field is the
+        base64-encoded image. ``size``/``quality``/``output_format``/
+        ``background`` from ``optional_params`` forward onto the tool spec
+        (``auto`` is dropped -- the backend picks its own default).
+        """
+        normalized_model = _normalize_model(model)
+        _validate_model_supported(normalized_model)
+
+        optional_params = optional_params or {}
+        tool: dict[str, Any] = {"type": "image_generation"}
+        for key in IMAGE_TOOL_PARAM_KEYS:
+            value = optional_params.get(key)
+            if value and value != "auto":
+                tool[key] = value
+
+        payload = {
+            "model": normalized_model,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": prompt}],
+                }
+            ],
+            "instructions": IMAGE_GEN_INSTRUCTIONS,
+            "tools": [tool],
+            "store": False,
+            "stream": True,
+        }
+
+        images: list[str] = []
+        async for event in self._http_client.stream_responses_sse(payload):
+            if event.get("raw_type") == "response.output_item.done":
+                data = event.get("data") or {}
+                item = data.get("item") or {}
+                if item.get("type") == "image_generation_call" and item.get("result"):
+                    images.append(item["result"])
+            elif event.get("type") == "done":
+                break
+
+        if not images:
+            raise RuntimeError("Codex image generation returned no image data")
+
+        if model_response is None:
+            model_response = ImageResponse()
+        model_response.created = int(time.time())
+        model_response.data = [ImageObject(b64_json=b64) for b64 in images]
+        return model_response
 
     def _process_sse_streaming_event(
         self, event: dict[str, Any], tool_tracker: ToolCallTracker
