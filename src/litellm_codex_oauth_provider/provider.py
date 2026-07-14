@@ -63,6 +63,12 @@ SUPPORTED_FAMILIES = {"codex", "codex-max", "codex-mini", "gpt-5.1"}
 # tool (verified: /responses streams image_generation_call items whose
 # `result` is base64 PNG). These optional_params forward onto the tool spec.
 IMAGE_TOOL_PARAM_KEYS = ("size", "quality", "output_format", "background")
+# DALL-E-era quality values from OpenAI image clients, mapped onto the
+# low/medium/high scale the image_generation tool expects.
+IMAGE_QUALITY_MAP = {"standard": "medium", "hd": "high"}
+# One image per /responses run; n>1 fans out into concurrent runs. Capped so a
+# large n can't stampede the backend.
+IMAGE_GEN_MAX_N = 4
 IMAGE_GEN_INSTRUCTIONS = (
     "You are an image generation assistant. Call the image_generation tool "
     "exactly once to produce the image the user describes. Do not answer in text."
@@ -584,7 +590,10 @@ class CodexAuthProvider(CustomLLM):
         ``image_generation_call`` output items whose ``result`` field is the
         base64-encoded image. ``size``/``quality``/``output_format``/
         ``background`` from ``optional_params`` forward onto the tool spec
-        (``auto`` is dropped -- the backend picks its own default).
+        (``auto`` is dropped -- the backend picks its own default; DALL-E-style
+        ``standard``/``hd`` quality maps to ``medium``/``high``). ``n`` fans
+        out into concurrent runs, one image each. ``response_format`` is
+        ignored: results are always ``b64_json`` (there is no hosted URL).
         """
         normalized_model = _normalize_model(model)
         _validate_model_supported(normalized_model)
@@ -593,8 +602,15 @@ class CodexAuthProvider(CustomLLM):
         tool: dict[str, Any] = {"type": "image_generation"}
         for key in IMAGE_TOOL_PARAM_KEYS:
             value = optional_params.get(key)
+            if key == "quality":
+                value = IMAGE_QUALITY_MAP.get(value, value)
             if value and value != "auto":
                 tool[key] = value
+
+        try:
+            n = max(1, min(int(optional_params.get("n") or 1), IMAGE_GEN_MAX_N))
+        except (TypeError, ValueError):
+            n = 1
 
         payload = {
             "model": normalized_model,
@@ -611,6 +627,21 @@ class CodexAuthProvider(CustomLLM):
             "stream": True,
         }
 
+        runs = await asyncio.gather(
+            *(self._collect_generated_images(payload) for _ in range(n))
+        )
+        images = [b64 for run in runs for b64 in run]
+        if not images:
+            raise RuntimeError("Codex image generation returned no image data")
+
+        if model_response is None:
+            model_response = ImageResponse()
+        model_response.created = int(time.time())
+        model_response.data = [ImageObject(b64_json=b64) for b64 in images]
+        return model_response
+
+    async def _collect_generated_images(self, payload: dict[str, Any]) -> list[str]:
+        """Run one ``/responses`` call and collect its generated image b64 payloads."""
         images: list[str] = []
         async for event in self._http_client.stream_responses_sse(payload):
             if event.get("raw_type") == "response.output_item.done":
@@ -620,15 +651,7 @@ class CodexAuthProvider(CustomLLM):
                     images.append(item["result"])
             elif event.get("type") == "done":
                 break
-
-        if not images:
-            raise RuntimeError("Codex image generation returned no image data")
-
-        if model_response is None:
-            model_response = ImageResponse()
-        model_response.created = int(time.time())
-        model_response.data = [ImageObject(b64_json=b64) for b64 in images]
-        return model_response
+        return images
 
     def _process_sse_streaming_event(
         self, event: dict[str, Any], tool_tracker: ToolCallTracker
