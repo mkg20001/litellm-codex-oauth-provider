@@ -36,7 +36,7 @@ from .images import inline_remote_images
 from .model_map import _strip_provider_prefix, get_model_family, normalize_model
 from .models import available_model_slugs, model_instructions
 from .prompts import DEFAULT_INSTRUCTIONS, build_tool_bridge_message, derive_instructions
-from .reasoning import apply_reasoning_config
+from .reasoning import VALID_EFFORTS, apply_reasoning_config
 from .remote_resources import fetch_codex_instructions
 from .sse_utils import (
     extract_text_from_sse_event,
@@ -56,7 +56,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
-VALID_REASONING = {"none", "minimal", "low", "medium", "high", "xhigh"}
+# Single source of truth for effort names lives in reasoning.py; per-model
+# support is narrower and resolved there against live discovery.
+VALID_REASONING = VALID_EFFORTS
 SUPPORTED_FAMILIES = {"codex", "codex-max", "codex-mini", "gpt-5.1"}
 
 # Image generation: the backend supports the Responses-API image_generation

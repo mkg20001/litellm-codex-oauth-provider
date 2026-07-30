@@ -81,18 +81,25 @@ from __future__ import annotations
 from typing import Any, Final
 
 from .model_map import extract_reasoning_effort_from_model, get_model_family
+from .models import model_default_reasoning_level, model_reasoning_levels
 
 DEFAULT_REASONING_EFFORT: Final[str] = "medium"
 DEFAULT_VERBOSITY: Final[str] = "medium"
 DEFAULT_REASONING_SUMMARY: Final[str] = "auto"
-VALID_EFFORTS: Final[set[str]] = {
+
+# Weakest to strongest. Used to clamp a requested effort onto the levels a
+# given model actually advertises.
+EFFORT_ORDER: Final[tuple[str, ...]] = (
     "none",
     "minimal",
     "low",
     "medium",
     "high",
     "xhigh",
-}
+    "max",
+    "ultra",
+)
+VALID_EFFORTS: Final[set[str]] = set(EFFORT_ORDER)
 
 
 def _coerce_effort(reasoning_effort: Any) -> str | None:
@@ -133,6 +140,10 @@ def _clamp_effort(family: str, effort: str) -> str:
     str
         Adjusted effort that respects family limitations.
     """
+    # No pre-discovery family ever supported max/ultra; treat them as xhigh
+    # before applying the per-family rules below.
+    if effort in {"max", "ultra"}:
+        effort = "xhigh"
     clamped = effort
     if family == "codex-mini":
         if effort in {"none", "minimal", "low"}:
@@ -147,6 +158,37 @@ def _clamp_effort(family: str, effort: str) -> str:
     elif family != "codex-max" and effort == "xhigh":
         clamped = "high"
     return clamped
+
+
+def _clamp_to_supported(effort: str, supported: list[str]) -> str:
+    """Clamp ``effort`` onto the levels a model actually advertises.
+
+    Picks the strongest supported level at or below the request, so asking for
+    more reasoning than a model offers degrades to its ceiling rather than
+    erroring. Falls back to the model's weakest level if the request is below
+    everything it supports.
+
+    Parameters
+    ----------
+    effort : str
+        Requested effort level.
+    supported : list[str]
+        Effort levels the backend advertises for this model.
+
+    Returns
+    -------
+    str
+        A level guaranteed to be in ``supported`` (unless it is unrecognizable).
+    """
+    if effort in supported:
+        return effort
+    known = set(supported)
+    ranked = [e for e in EFFORT_ORDER if e in known]
+    if not ranked or effort not in EFFORT_ORDER:
+        return effort
+    target = EFFORT_ORDER.index(effort)
+    at_or_below = [e for e in ranked if EFFORT_ORDER.index(e) <= target]
+    return at_or_below[-1] if at_or_below else ranked[0]
 
 
 def apply_reasoning_config(
@@ -181,11 +223,23 @@ def apply_reasoning_config(
     """
     inferred_effort = extract_reasoning_effort_from_model(original_model)
     provided_effort = _coerce_effort(reasoning_effort)
-    effort = (provided_effort or inferred_effort or DEFAULT_REASONING_EFFORT).lower()
-    effort = effort if effort in VALID_EFFORTS else DEFAULT_REASONING_EFFORT
 
-    family = get_model_family(normalized_model)
-    clamped_effort = _clamp_effort(family, effort)
+    # Prefer what the backend says this model supports over the static family
+    # heuristic: model slugs and their effort ranges change over time (gpt-5.6-*
+    # added max/ultra), and the heuristic classifies every current slug as
+    # "other", which would cap them all at high.
+    supported = model_reasoning_levels(normalized_model)
+    if supported:
+        fallback = model_default_reasoning_level(normalized_model) or DEFAULT_REASONING_EFFORT
+        effort = (provided_effort or inferred_effort or fallback).lower()
+        if effort not in VALID_EFFORTS:
+            effort = fallback.lower()
+        clamped_effort = _clamp_to_supported(effort, supported)
+    else:
+        effort = (provided_effort or inferred_effort or DEFAULT_REASONING_EFFORT).lower()
+        effort = effort if effort in VALID_EFFORTS else DEFAULT_REASONING_EFFORT
+        clamped_effort = _clamp_effort(get_model_family(normalized_model), effort)
+
     resolved_verbosity = (verbosity or DEFAULT_VERBOSITY).lower()
 
     return {

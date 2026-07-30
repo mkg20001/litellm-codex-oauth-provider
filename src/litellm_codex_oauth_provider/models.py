@@ -101,6 +101,35 @@ def listable_model_slugs() -> list[str]:
     ]
 
 
+def model_reasoning_levels(slug: str) -> list[str]:
+    """Effort levels the backend advertises for ``slug``, in its own order.
+
+    The Codex backend reports ``supported_reasoning_levels`` per model (e.g.
+    ``low..ultra`` for gpt-5.6-*, ``low..xhigh`` for gpt-5.5). Empty list when
+    discovery is unavailable or the model doesn't declare any, which callers
+    treat as "fall back to the static family heuristic".
+    """
+    for m in fetch_models():
+        if m.get("slug") != slug:
+            continue
+        levels = m.get("supported_reasoning_levels") or []
+        return [
+            lvl["effort"]
+            for lvl in levels
+            if isinstance(lvl, dict) and isinstance(lvl.get("effort"), str) and lvl["effort"]
+        ]
+    return []
+
+
+def model_default_reasoning_level(slug: str) -> str | None:
+    """The backend's own default effort for ``slug``, if it declares one."""
+    for m in fetch_models():
+        if m.get("slug") == slug:
+            value = m.get("default_reasoning_level")
+            return value if isinstance(value, str) and value else None
+    return None
+
+
 def model_instructions(slug: str) -> str | None:
     """Canonical ``base_instructions`` for ``slug``, if the backend provides them."""
     for m in fetch_models():
