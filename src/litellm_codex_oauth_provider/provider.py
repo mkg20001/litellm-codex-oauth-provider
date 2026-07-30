@@ -158,8 +158,15 @@ def _prepare_common_payload(
     normalized_model = _normalize_model(model)
     _validate_model_supported(normalized_model)
 
-    validated_reasoning = _coerce_reasoning_effort(kwargs.get("reasoning_effort"))
     optional_params = kwargs.get("optional_params", {}) or {}
+    # litellm dispatches to custom handlers with every caller-supplied param
+    # bundled into `optional_params` -- reasoning_effort/verbosity never arrive
+    # as top-level kwargs from the proxy. Still prefer a top-level kwarg so
+    # direct (non-litellm) callers keep working.
+    validated_reasoning = _coerce_reasoning_effort(
+        kwargs.get("reasoning_effort") or optional_params.get("reasoning_effort")
+    )
+    verbosity = kwargs.get("verbosity") or optional_params.get("verbosity")
     tools = kwargs.get("tools") or optional_params.get("tools")
     normalized_tools = _normalize_tools(tools) if tools else None
 
@@ -184,7 +191,7 @@ def _prepare_common_payload(
             "messages": prepared_messages,
             "tools": normalized_tools,
             "reasoning_effort": validated_reasoning,
-            "verbosity": kwargs.get("verbosity"),
+            "verbosity": verbosity,
             "optional_params": optional_params,
         }
     )
