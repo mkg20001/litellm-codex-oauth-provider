@@ -88,6 +88,7 @@ from typing import Any, Final
 
 from . import constants
 from .remote_resources import fetch_codex_instructions
+from .tool_names import shorten_tool_name
 
 DEFAULT_INSTRUCTIONS: Final[str] = constants.DEFAULT_INSTRUCTIONS
 LEGACY_TOOLCHAIN_MARKERS: Final[tuple[str, ...]] = (
@@ -219,6 +220,10 @@ def _function_call_items(message: dict[str, Any]) -> list[dict[str, Any]]:
     or ``function`` key. Chat-completions assistant messages carry these as
     ``tool_calls: [{id, type:"function", function:{name, arguments}}, ...]`` (and
     historically as a single legacy ``function_call: {name, arguments}`` field).
+
+    Names are shortened to the backend's 128-character limit (see
+    ``tool_names``); replayed history has to shorten exactly the way the matching
+    tool definition did, which the deterministic helper guarantees.
     """
     items: list[dict[str, Any]] = []
     for tc in message.get("tool_calls") or []:
@@ -231,7 +236,7 @@ def _function_call_items(message: dict[str, Any]) -> list[dict[str, Any]]:
             {
                 "type": "function_call",
                 "call_id": tc.get("id") or tc.get("call_id"),
-                "name": fn.get("name"),
+                "name": shorten_tool_name(fn.get("name")),
                 "arguments": _stringify_arguments(fn.get("arguments")),
             }
         )
@@ -241,7 +246,7 @@ def _function_call_items(message: dict[str, Any]) -> list[dict[str, Any]]:
             {
                 "type": "function_call",
                 "call_id": message.get("id") or message.get("call_id"),
-                "name": legacy.get("name"),
+                "name": shorten_tool_name(legacy.get("name")),
                 "arguments": _stringify_arguments(legacy.get("arguments")),
             }
         )

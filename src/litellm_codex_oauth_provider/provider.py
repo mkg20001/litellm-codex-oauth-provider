@@ -50,6 +50,7 @@ from .streaming_utils import (
     build_text_chunk,
     build_tool_call_chunk,
 )
+from .tool_names import build_tool_name_map, restore_tool_name, shorten_tool_name
 
 if TYPE_CHECKING:
     from litellm.types.utils import GenericStreamingChunk
@@ -155,8 +156,13 @@ def _prepare_common_payload(
     model: str,
     messages: list[dict[str, Any]],
     **kwargs: Any,
-) -> tuple[dict[str, Any], str]:
-    """Normalize inputs, derive instructions/tools, and return payload + normalized model."""
+) -> tuple[dict[str, Any], str, dict[str, str]]:
+    """Normalize inputs, derive instructions/tools, and return payload + model + name map.
+
+    The third element maps each shortened tool name back to the name the caller
+    sent, for the response side to undo (empty unless a name exceeded the
+    backend's 128-character limit).
+    """
     normalized_model = _normalize_model(model)
     _validate_model_supported(normalized_model)
 
@@ -171,6 +177,7 @@ def _prepare_common_payload(
     verbosity = kwargs.get("verbosity") or optional_params.get("verbosity")
     tools = kwargs.get("tools") or optional_params.get("tools")
     normalized_tools = _normalize_tools(tools) if tools else None
+    tool_name_map = build_tool_name_map(tools)
 
     # Prefer the canonical base_instructions the backend ships for this model;
     # fall back to the GitHub-sourced instructions, then to the default.
@@ -197,7 +204,7 @@ def _prepare_common_payload(
             "optional_params": optional_params,
         }
     )
-    return payload, normalized_model
+    return payload, normalized_model, tool_name_map
 
 
 def _run_sync(coro: asyncio.Future | asyncio.Awaitable[T]) -> T:
@@ -401,6 +408,11 @@ def _normalize_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]
         else:
             tool_dict.setdefault("type", "function")
 
+        # The backend caps a function name at 128 characters. Shorten over-long
+        # names here the same way prompts.py shortens them on replayed
+        # function_call items, so a definition and its history items agree.
+        tool_dict["name"] = shorten_tool_name(tool_dict.get("name"))
+
         # Codex rejects strict functions whose parameter schema has any typeless
         # node. Fill in inferable types; if the schema is still not strict-safe
         # (a free-form param), drop strict so the backend's lenient path accepts
@@ -528,14 +540,16 @@ class CodexAuthProvider(CustomLLM):
         **kwargs: Any,
     ) -> ModelResponse:
         """Complete a chat completion request using Codex authentication with SSE accumulation."""
-        payload, normalized_model = _prepare_common_payload(model, messages, **kwargs)
+        payload, normalized_model, tool_name_map = _prepare_common_payload(
+            model, messages, **kwargs
+        )
         # Vision: the backend can't reliably fetch arbitrary public URLs, so
         # inline remote images as data URLs before sending (see images.py).
         await inline_remote_images(payload["input"])
 
         # Process SSE events and build response
         accumulated_text, tool_calls, usage, finish_reason = await self._process_sse_events(
-            self._http_client.stream_responses_sse(payload)
+            self._http_client.stream_responses_sse(payload), tool_name_map
         )
 
         return self._build_model_response(
@@ -562,13 +576,15 @@ class CodexAuthProvider(CustomLLM):
         **kwargs: Any,
     ) -> AsyncIterator[GenericStreamingChunk]:
         """True streaming method that yields SSE events as streaming chunks."""
-        payload, _normalized_model = _prepare_common_payload(model, messages, **kwargs)
+        payload, _normalized_model, tool_name_map = _prepare_common_payload(
+            model, messages, **kwargs
+        )
         await inline_remote_images(payload["input"])
         tool_tracker = ToolCallTracker()
 
         try:
             async for event in self._http_client.stream_responses_sse(payload):
-                chunk = self._process_sse_streaming_event(event, tool_tracker)
+                chunk = self._process_sse_streaming_event(event, tool_tracker, tool_name_map)
                 if chunk:
                     yield chunk
         except Exception as exc:
@@ -663,7 +679,10 @@ class CodexAuthProvider(CustomLLM):
         return images
 
     def _process_sse_streaming_event(
-        self, event: dict[str, Any], tool_tracker: ToolCallTracker
+        self,
+        event: dict[str, Any],
+        tool_tracker: ToolCallTracker,
+        tool_name_map: Mapping[str, str] | None = None,
     ) -> GenericStreamingChunk | None:
         """Process individual SSE event for streaming.
 
@@ -673,6 +692,8 @@ class CodexAuthProvider(CustomLLM):
             SSE event to process
         tool_tracker : ToolCallTracker
             Tool call state tracker
+        tool_name_map : Mapping[str, str] | None
+            Shortened tool name -> caller's original name
 
         Returns
         -------
@@ -684,7 +705,7 @@ class CodexAuthProvider(CustomLLM):
             "text_delta": self._build_text_chunk_from_event,
             "reasoning_delta": self._build_reasoning_chunk_from_event,
             "function_call_started": lambda evt: self._handle_tool_call_started(
-                evt, tool_tracker
+                evt, tool_tracker, tool_name_map
             ),
             "function_arguments_delta": lambda evt: self._build_tool_chunk_from_event(
                 evt, tool_tracker
@@ -713,7 +734,10 @@ class CodexAuthProvider(CustomLLM):
         return build_reasoning_chunk(reasoning_delta)
 
     def _handle_tool_call_started(
-        self, event: dict[str, Any], tool_tracker: ToolCallTracker
+        self,
+        event: dict[str, Any],
+        tool_tracker: ToolCallTracker,
+        tool_name_map: Mapping[str, str] | None = None,
     ) -> GenericStreamingChunk | None:
         """Record the tool name + call_id from ``response.output_item.added``.
 
@@ -721,10 +745,14 @@ class CodexAuthProvider(CustomLLM):
         bookkeeping the downstream chunk would be tagged with the placeholder
         ``name="unknown"``. Yields one chunk so the client sees the tool call
         opened (with empty arguments) before the arguments stream in.
+
+        A name that was shortened to fit the backend's limit is restored here, so
+        the tracker -- and every argument-delta chunk built from it -- carries the
+        name the caller actually registered.
         """
         item_id = event.get("item_id")
         call_id = event.get("call_id")
-        name = event.get("name")
+        name = restore_tool_name(event.get("name"), tool_name_map)
         if not item_id or not call_id or not name:
             return None
         tool_tracker.start_tool_call(item_id, name, call_id=call_id)
@@ -788,7 +816,9 @@ class CodexAuthProvider(CustomLLM):
         return normalize_usage(usage_value), finish_value
 
     async def _process_sse_events(
-        self, event_stream: AsyncIterator[dict[str, Any]]
+        self,
+        event_stream: AsyncIterator[dict[str, Any]],
+        tool_name_map: Mapping[str, str] | None = None,
     ) -> tuple[str, list[dict], dict[str, int], str]:
         """Process SSE events and accumulate content.
 
@@ -796,6 +826,8 @@ class CodexAuthProvider(CustomLLM):
         ----------
         event_stream : AsyncIterator[dict[str, Any]]
             SSE event stream from the API
+        tool_name_map : Mapping[str, str] | None
+            Shortened tool name -> caller's original name
 
         Returns
         -------
@@ -821,7 +853,7 @@ class CodexAuthProvider(CustomLLM):
                 elif event_type == "function_call_started":
                     item_id = event.get("item_id")
                     call_id = event.get("call_id")
-                    name = event.get("name")
+                    name = restore_tool_name(event.get("name"), tool_name_map)
                     if item_id and call_id and name:
                         tool_starts[item_id] = (call_id, name)
                 elif event_type == "function_arguments_delta":
