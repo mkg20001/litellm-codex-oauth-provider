@@ -747,8 +747,11 @@ class CodexAuthProvider(CustomLLM):
         opened (with empty arguments) before the arguments stream in.
 
         A name that was shortened to fit the backend's limit is restored here, so
-        the tracker -- and every argument-delta chunk built from it -- carries the
-        name the caller actually registered.
+        the client sees the name the caller actually registered.
+
+        This is the only chunk carrying ``id`` and ``name``: clients concatenate
+        streamed names, so repeating them on the argument deltas would come out as
+        ``shell.execshell.exec...``.
         """
         item_id = event.get("item_id")
         call_id = event.get("call_id")
@@ -756,7 +759,8 @@ class CodexAuthProvider(CustomLLM):
         if not item_id or not call_id or not name:
             return None
         tool_tracker.start_tool_call(item_id, name, call_id=call_id)
-        return build_tool_call_chunk(call_id, name, "")
+        tool_index = tool_tracker.get_active_calls()[item_id]["index"]
+        return build_tool_call_chunk(call_id, name, "", tool_index=tool_index)
 
     def _build_tool_chunk_from_event(
         self, event: dict[str, Any], tool_tracker: ToolCallTracker
@@ -766,8 +770,9 @@ class CodexAuthProvider(CustomLLM):
             return None
 
         # Argument-delta events from the Responses API are keyed by ``item_id``;
-        # the chat-completions chunk needs the real ``call_id`` + ``name``, which
-        # were captured earlier in _handle_tool_call_started.
+        # map it to the call opened in _handle_tool_call_started. That chunk
+        # already sent ``id`` + ``name``; deltas carry only the arguments and the
+        # call's position, which clients use to append to the right call.
         item_id = event.get("item_id") or tool_data.get("call_id")
         arguments = tool_data.get("arguments", "")
         active = tool_tracker.get_active_calls().get(item_id) if item_id else None
@@ -775,7 +780,7 @@ class CodexAuthProvider(CustomLLM):
             return None
 
         tool_tracker.add_arguments_delta(item_id, arguments)
-        return build_tool_call_chunk(active["call_id"], active["name"], arguments)
+        return build_tool_call_chunk(None, None, arguments, tool_index=active["index"])
 
     def _build_completion_chunk_from_event(self, event: dict[str, Any]) -> GenericStreamingChunk:
         usage = event.get("usage") or {}

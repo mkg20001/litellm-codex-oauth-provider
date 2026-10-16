@@ -12,7 +12,7 @@ Key Functions:
 
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from litellm.types.utils import ChatCompletionUsageBlock, GenericStreamingChunk
 
@@ -95,22 +95,36 @@ def build_reasoning_chunk(reasoning_delta: str, index: int = 0) -> GenericStream
 
 
 def build_tool_call_chunk(
-    call_id: str, name: str, arguments: str, is_final: bool = False, index: int = 0
+    call_id: str | None,
+    name: str | None,
+    arguments: str,
+    is_final: bool = False,
+    index: int = 0,
+    tool_index: int | None = None,
 ) -> GenericStreamingChunk:
     """Build streaming chunk for tool call arguments.
 
+    Chat-completions streaming clients accumulate ``function.name`` and
+    ``function.arguments`` by concatenation, keyed by the tool call's position
+    (``tool_use.index``). So only a call's first chunk may carry ``id`` and
+    ``name``; later argument deltas pass ``None`` for both, or the client glues
+    the name onto itself once per delta.
+
     Parameters
     ----------
-    call_id : str
-        Unique identifier for the tool call
-    name : str
-        Name of the function being called
+    call_id : str | None
+        Unique identifier for the tool call (first chunk only)
+    name : str | None
+        Name of the function being called (first chunk only)
     arguments : str
         JSON string of function arguments (can be incremental)
     is_final : bool, default False
         Whether this is the final chunk for this tool call
     index : int, default 0
         Choice index in the response
+    tool_index : int | None
+        Position of this tool call within the response; distinct per parallel
+        call so clients don't merge them. Defaults to ``index``.
 
     Returns
     -------
@@ -120,7 +134,7 @@ def build_tool_call_chunk(
     tool_call = ChatCompletionToolCallChunk(
         id=call_id,
         type="function",
-        index=index,
+        index=index if tool_index is None else tool_index,
         function=ChatCompletionToolCallFunctionChunk(name=name, arguments=arguments),
     )
 
@@ -236,7 +250,10 @@ class ToolCallTracker:
     """
 
     def __init__(self) -> None:
-        self._active_calls: dict[str, dict[str, str]] = {}
+        self._active_calls: dict[str, dict[str, Any]] = {}
+        # Calls started so far; each call's position (its chat-completions
+        # ``tool_calls[].index``), so parallel calls stream into separate slots.
+        self._started = 0
 
     def start_tool_call(self, key: str, name: str, call_id: str | None = None) -> None:
         """Start tracking a new tool call.
@@ -256,7 +273,9 @@ class ToolCallTracker:
             "name": name,
             "arguments": "",
             "call_id": call_id or key,
+            "index": self._started,
         }
+        self._started += 1
 
     def add_arguments_delta(self, call_id: str, arguments_delta: str) -> None:
         """Add incremental arguments to a tool call.
@@ -292,18 +311,18 @@ class ToolCallTracker:
         return ChatCompletionToolCallChunk(
             id=call_data.get("call_id", call_id),
             type="function",
-            index=0,  # Simplified for now
+            index=call_data["index"],
             function=ChatCompletionToolCallFunctionChunk(
                 name=call_data["name"], arguments=call_data["arguments"]
             ),
         )
 
-    def get_active_calls(self) -> dict[str, dict[str, str]]:
+    def get_active_calls(self) -> dict[str, dict[str, Any]]:
         """Get currently active tool calls.
 
         Returns
         -------
-        dict[str, dict[str, str]]
+        dict[str, dict[str, Any]]
             Active tool calls with their current state
         """
         return self._active_calls.copy()
@@ -311,3 +330,4 @@ class ToolCallTracker:
     def clear(self) -> None:
         """Clear all active tool calls."""
         self._active_calls.clear()
+        self._started = 0

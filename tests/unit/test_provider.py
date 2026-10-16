@@ -149,9 +149,51 @@ def test_streaming_tool_call_chunks_carry_real_name(provider: CodexAuthProvider)
 
     arg_chunk = provider._process_sse_streaming_event(delta, tracker)  # noqa: SLF001
     assert arg_chunk is not None
-    assert arg_chunk["tool_use"]["id"] == "call_abc"
-    assert arg_chunk["tool_use"]["function"]["name"] == "shell"
+    # Clients concatenate streamed names, so id/name go out on the opening chunk only.
+    assert arg_chunk["tool_use"]["id"] is None
+    assert arg_chunk["tool_use"]["function"]["name"] is None
     assert arg_chunk["tool_use"]["function"]["arguments"] == '{"command":["ls"]}'
+    assert arg_chunk["tool_use"]["index"] == open_chunk["tool_use"]["index"] == 0
+
+
+def test_streaming_parallel_tool_calls_get_distinct_indexes(
+    provider: CodexAuthProvider,
+) -> None:
+    """Parallel tool calls stream into separate ``tool_calls[].index`` slots, and
+    accumulating the chunks the way a chat-completions client does yields each
+    name once -- not ``shell.execshell.exec...``."""
+    from litellm_codex_oauth_provider.streaming_utils import ToolCallTracker
+
+    tracker = ToolCallTracker()
+    events = [
+        {"type": "function_call_started", "item_id": "fc_1", "call_id": "c1", "name": "shell.exec"},
+        {"type": "function_call_started", "item_id": "fc_2", "call_id": "c2", "name": "read"},
+    ]
+    for item_id, parts in (("fc_1", ['{"cmd":', '"ls"}']), ("fc_2", ["{", "}"])):
+        events += [
+            {
+                "type": "function_arguments_delta",
+                "item_id": item_id,
+                "delta": part,
+                "data": {"delta": part, "item_id": item_id},
+            }
+            for part in parts
+        ]
+
+    calls: dict[int, dict[str, str]] = {}
+    for event in events:
+        chunk = provider._process_sse_streaming_event(event, tracker)  # noqa: SLF001
+        assert chunk is not None
+        tool = chunk["tool_use"]
+        acc = calls.setdefault(tool["index"], {"id": "", "name": "", "arguments": ""})
+        acc["id"] += tool["id"] or ""
+        acc["name"] += tool["function"]["name"] or ""
+        acc["arguments"] += tool["function"]["arguments"]
+
+    assert calls == {
+        0: {"id": "c1", "name": "shell.exec", "arguments": '{"cmd":"ls"}'},
+        1: {"id": "c2", "name": "read", "arguments": "{}"},
+    }
 
 
 def test_streaming_tool_call_without_start_event_is_dropped(
