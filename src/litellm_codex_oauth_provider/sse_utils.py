@@ -51,6 +51,9 @@ _FUNCTION_ARGUMENTS_TYPES = {
 # or function_call. We can only treat it as a tool-call start when item.type
 # is "function_call" -- handled in _resolve_normalized_type below.
 _FUNCTION_CALL_START_RAW = "response.output_item.added"
+# Carries a call's complete arguments. The backend may skip the argument deltas
+# entirely and send the arguments only here.
+_FUNCTION_ARGUMENTS_DONE_RAW = "response.function_call_arguments.done"
 _COMPLETION_EVENT_TYPES = {"response.done", "response.completed", "completed", "response"}
 
 
@@ -132,6 +135,8 @@ def _resolve_normalized_type(raw_type: str | None, data: Any = None) -> str:
             if isinstance(item, dict) and item.get("type") == "function_call":
                 return "function_call_started"
         return "unknown"
+    if raw_type == _FUNCTION_ARGUMENTS_DONE_RAW:
+        return "function_arguments_done"
     if raw_type in _COMPLETION_EVENT_TYPES:
         return "completion"
     return raw_type or "unknown"
@@ -173,6 +178,19 @@ def _attach_function_call_start_metadata(
     event["name"] = item.get("name")
 
 
+def _attach_function_arguments_done_metadata(
+    event: SSEEvent, data: Any, normalized_type: str
+) -> None:
+    """Surface item_id + the complete arguments from a
+    ``response.function_call_arguments.done`` event.
+    """
+    if normalized_type != "function_arguments_done" or not isinstance(data, dict):
+        return
+    event["item_id"] = data.get("item_id")
+    arguments = data.get("arguments")
+    event["arguments"] = arguments if isinstance(arguments, str) else ""
+
+
 def _attach_completion_metadata(event: SSEEvent, data: Any, normalized_type: str) -> None:
     if normalized_type != "completion":
         return
@@ -205,6 +223,7 @@ def _normalize_event(
     _attach_delta_metadata(event, data, normalized_type)
     _attach_completion_metadata(event, data, normalized_type)
     _attach_function_call_start_metadata(event, data, normalized_type)
+    _attach_function_arguments_done_metadata(event, data, normalized_type)
 
     if normalized_type == "unknown":
         logger.debug("Unhandled SSE event type", extra={"event_type": raw_type, "data": data})
@@ -312,6 +331,19 @@ def extract_text_from_sse_event(event: SSEEvent) -> str | None:
         except (json.JSONDecodeError, AttributeError):
             return data
     return None
+
+
+def unstreamed_arguments(streamed: str, final: str) -> str:
+    """Return the part of a call's ``final`` arguments not yet sent as deltas.
+
+    The backend sometimes streams no argument deltas and only reports the full
+    arguments on ``response.function_call_arguments.done``; then all of ``final``
+    is still owed. If the deltas diverged from ``final`` there is no safe suffix
+    to append, so nothing more is sent.
+    """
+    if final.startswith(streamed):
+        return final[len(streamed) :]
+    return ""
 
 
 def extract_tool_call_from_sse_event(event: SSEEvent) -> dict[str, Any] | None:

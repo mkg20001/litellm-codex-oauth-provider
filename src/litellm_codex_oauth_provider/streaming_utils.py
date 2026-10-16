@@ -317,6 +317,11 @@ class ToolCallTracker:
             ),
         )
 
+    @property
+    def started_count(self) -> int:
+        """Number of tool calls started so far (including finalized ones)."""
+        return self._started
+
     def get_active_calls(self) -> dict[str, dict[str, Any]]:
         """Get currently active tool calls.
 

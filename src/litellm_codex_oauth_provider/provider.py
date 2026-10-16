@@ -42,6 +42,7 @@ from .sse_utils import (
     extract_text_from_sse_event,
     extract_tool_call_from_sse_event,
     normalize_usage,
+    unstreamed_arguments,
 )
 from .streaming_utils import (
     ToolCallTracker,
@@ -710,7 +711,12 @@ class CodexAuthProvider(CustomLLM):
             "function_arguments_delta": lambda evt: self._build_tool_chunk_from_event(
                 evt, tool_tracker
             ),
-            "completion": self._build_completion_chunk_from_event,
+            "function_arguments_done": lambda evt: self._build_tool_done_chunk_from_event(
+                evt, tool_tracker
+            ),
+            "completion": lambda evt: self._build_completion_chunk_from_event(
+                evt, tool_tracker
+            ),
         }
 
         handler = handlers.get(event_type)
@@ -782,7 +788,28 @@ class CodexAuthProvider(CustomLLM):
         tool_tracker.add_arguments_delta(item_id, arguments)
         return build_tool_call_chunk(None, None, arguments, tool_index=active["index"])
 
-    def _build_completion_chunk_from_event(self, event: dict[str, Any]) -> GenericStreamingChunk:
+    def _build_tool_done_chunk_from_event(
+        self, event: dict[str, Any], tool_tracker: ToolCallTracker
+    ) -> GenericStreamingChunk | None:
+        """Send whatever part of a call's final arguments the deltas didn't.
+
+        The backend may stream no ``function_call_arguments.delta`` events at all
+        and report the arguments only on ``.done``; without this the client would
+        see the call with empty arguments.
+        """
+        item_id = event.get("item_id")
+        active = tool_tracker.get_active_calls().get(item_id) if item_id else None
+        if not active:
+            return None
+        remainder = unstreamed_arguments(active["arguments"], event.get("arguments") or "")
+        if not remainder:
+            return None
+        tool_tracker.add_arguments_delta(item_id, remainder)
+        return build_tool_call_chunk(None, None, remainder, tool_index=active["index"])
+
+    def _build_completion_chunk_from_event(
+        self, event: dict[str, Any], tool_tracker: ToolCallTracker | None = None
+    ) -> GenericStreamingChunk:
         usage = event.get("usage") or {}
         finish_reason = event.get("finish_reason") or "stop"
 
@@ -798,6 +825,10 @@ class CodexAuthProvider(CustomLLM):
             usage = data.get("usage", usage)
             finish_reason = data.get("finish_reason", finish_reason)
 
+        # The backend reports "stop" even when the turn ended in tool calls;
+        # chat-completions clients key off "tool_calls" to run them.
+        if tool_tracker is not None and tool_tracker.started_count and finish_reason == "stop":
+            finish_reason = "tool_calls"
         return build_final_chunk(normalize_usage(usage), finish_reason)
 
     def _extract_completion_metadata(
@@ -844,6 +875,8 @@ class CodexAuthProvider(CustomLLM):
         # item_id -> (call_id, name). Populated by function_call_started events;
         # used to enrich the otherwise-anonymous delta events.
         tool_starts: dict[str, tuple[str, str]] = {}
+        # item_id -> arguments streamed so far, to complete them from `.done`.
+        streamed_arguments: dict[str, str] = {}
         usage: dict[str, int] = {}
         finish_reason = "stop"
 
@@ -869,7 +902,25 @@ class CodexAuthProvider(CustomLLM):
                         if start:
                             tool_data["call_id"] = start[0]
                             tool_data["name"] = start[1]
+                            streamed_arguments[item_id] = (
+                                streamed_arguments.get(item_id, "") + tool_data["arguments"]
+                            )
                         tool_calls.append(tool_data)
+                elif event_type == "function_arguments_done":
+                    item_id = event.get("item_id")
+                    start = tool_starts.get(item_id) if item_id else None
+                    if start:
+                        streamed = streamed_arguments.get(item_id, "")
+                        final = event.get("arguments") or ""
+                        # Always record the call, even with no arguments.
+                        tool_calls.append(
+                            {
+                                "call_id": start[0],
+                                "name": start[1],
+                                "arguments": unstreamed_arguments(streamed, final),
+                            }
+                        )
+                        streamed_arguments[item_id] = final
                 elif event_type == "completion":
                     usage, finish_reason = self._extract_completion_metadata(
                         event, usage, finish_reason
@@ -880,6 +931,8 @@ class CodexAuthProvider(CustomLLM):
             logger.error(f"Error during SSE processing: {exc}")
             raise RuntimeError(f"Failed to process Codex response: {exc}") from exc
 
+        if tool_calls and finish_reason == "stop":
+            finish_reason = "tool_calls"
         return accumulated_text, tool_calls, usage, finish_reason
 
     def _build_model_response(

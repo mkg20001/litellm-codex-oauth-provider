@@ -124,7 +124,8 @@ def test_completion_builds_model_response(
 def test_streaming_tool_call_chunks_carry_real_name(provider: CodexAuthProvider) -> None:
     """End-to-end SSE -> chunk: the chunk's ``function.name`` is the real tool
     name from ``response.output_item.added`` -- not the literal "unknown" the
-    old code emitted when the name only existed on the start event."""
+    old code emitted when the name only existed on the start event.
+    """
     from litellm_codex_oauth_provider.streaming_utils import ToolCallTracker
 
     tracker = ToolCallTracker()
@@ -161,7 +162,8 @@ def test_streaming_parallel_tool_calls_get_distinct_indexes(
 ) -> None:
     """Parallel tool calls stream into separate ``tool_calls[].index`` slots, and
     accumulating the chunks the way a chat-completions client does yields each
-    name once -- not ``shell.execshell.exec...``."""
+    name once -- not ``shell.execshell.exec...``.
+    """
     from litellm_codex_oauth_provider.streaming_utils import ToolCallTracker
 
     tracker = ToolCallTracker()
@@ -200,7 +202,8 @@ def test_streaming_tool_call_without_start_event_is_dropped(
     provider: CodexAuthProvider,
 ) -> None:
     """An arg-delta with no preceding start event has no real name/call_id, so
-    we drop the chunk rather than emit ``name="unknown"`` to the client."""
+    we drop the chunk rather than emit ``name="unknown"`` to the client.
+    """
     from litellm_codex_oauth_provider.streaming_utils import ToolCallTracker
 
     tracker = ToolCallTracker()
@@ -211,6 +214,72 @@ def test_streaming_tool_call_without_start_event_is_dropped(
         "data": {"delta": "{}", "item_id": "fc_unknown"},
     }
     assert provider._process_sse_streaming_event(delta, tracker) is None  # noqa: SLF001
+
+
+def _backend_tool_call_events(arguments_deltas: list[str]) -> list[dict[str, Any]]:
+    """Normalized SSE events for one tool call, shaped like the live backend's.
+
+    The backend streams ``arguments_deltas`` (possibly none) and then reports the
+    complete arguments on ``response.function_call_arguments.done``.
+    """
+    from litellm_codex_oauth_provider.sse_utils import _normalize_event
+
+    item = {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "shell_exec"}
+    raw = [{"type": "response.output_item.added", "output_index": 0, "item": {**item, "arguments": ""}}]
+    raw += [
+        {"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": d}
+        for d in arguments_deltas
+    ]
+    raw += [
+        {"type": "response.function_call_arguments.done", "item_id": "fc_1", "arguments": '{"cmd":"pwd"}'},
+        {"type": "response.output_item.done", "output_index": 0, "item": {**item, "arguments": '{"cmd":"pwd"}'}},
+        {"type": "response.completed", "response": {"usage": {"input_tokens": 1, "output_tokens": 1}}},
+    ]
+    events = [_normalize_event(r["type"], r) for r in raw]
+    return [e for e in events if e is not None]
+
+
+@pytest.mark.parametrize("deltas", [[], ['{"cmd":', '"pwd"}'], ['{"cmd":']])
+def test_streaming_tool_call_arguments_completed_from_done_event(
+    provider: CodexAuthProvider, deltas: list[str]
+) -> None:
+    """The backend may send arguments only on ``.done`` (no deltas at all); the
+    client must still receive them exactly once, and finish with tool_calls.
+    """
+    from litellm_codex_oauth_provider.streaming_utils import ToolCallTracker
+
+    tracker = ToolCallTracker()
+    arguments = ""
+    finish_reason = None
+    for event in _backend_tool_call_events(deltas):
+        chunk = provider._process_sse_streaming_event(event, tracker)  # noqa: SLF001
+        if chunk and chunk["tool_use"]:
+            arguments += chunk["tool_use"]["function"]["arguments"]
+        if chunk and chunk["is_finished"]:
+            finish_reason = chunk["finish_reason"]
+
+    assert arguments == '{"cmd":"pwd"}'
+    assert finish_reason == "tool_calls"
+
+
+@pytest.mark.parametrize("deltas", [[], ['{"cmd":', '"pwd"}'], ['{"cmd":']])
+async def test_completion_tool_call_arguments_completed_from_done_event(
+    provider: CodexAuthProvider, deltas: list[str]
+) -> None:
+    """Non-streaming path: same backend shapes accumulate into one complete call."""
+
+    async def stream() -> AsyncIterator[dict[str, Any]]:
+        for event in _backend_tool_call_events(deltas):
+            yield event
+
+    _text, tool_calls, _usage, finish_reason = await provider._process_sse_events(stream())  # noqa: SLF001
+    response = provider._build_model_response("", tool_calls, {}, finish_reason, "m")  # noqa: SLF001
+
+    calls = response.choices[0].message.tool_calls
+    assert [(c.id, c.function.name, c.function.arguments) for c in calls] == [
+        ("call_1", "shell_exec", '{"cmd":"pwd"}')
+    ]
+    assert response.choices[0].finish_reason == "tool_calls"
 
 
 def test_normalize_tools_handles_function_name() -> None:
